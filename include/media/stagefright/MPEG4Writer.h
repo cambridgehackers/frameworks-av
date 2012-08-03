@@ -59,6 +59,7 @@ public:
     status_t setGeoData(int latitudex10000, int longitudex10000);
     void setStartTimeOffsetMs(int ms) { mStartTimeOffsetMs = ms; }
     int32_t getStartTimeOffsetMs() const { return mStartTimeOffsetMs; }
+    void notifyGotAllCodecSpecificData();
 
 protected:
     virtual ~MPEG4Writer();
@@ -89,6 +90,8 @@ private:
     int mLongitudex10000;
     bool mAreGeoTagsAvailable;
     int32_t mStartTimeOffsetMs;
+    bool mGotAllCodecSpecificData;
+    int32_t mSequenceNumber;
 
     Mutex mLock;
 
@@ -101,23 +104,37 @@ private:
     status_t startTracks(MetaData *params);
     size_t numTracks();
     int64_t estimateMoovBoxSize(int32_t bitRate);
+    int64_t estimateMoofBoxSize();
 
     struct Chunk {
         Track               *mTrack;        // Owner
-        int64_t             mTimeStampUs;   // Timestamp of the 1st sample
-        List<MediaBuffer *> mSamples;       // Sample data
+        int64_t             mTimeStampUs;   // Timestamp of the sample
+        int32_t             mDurationTicks; // Duration of sample
+        MediaBuffer * mSamples;             // Sample data
 
         // Convenient constructor
         Chunk(): mTrack(NULL), mTimeStampUs(0) {}
 
-        Chunk(Track *track, int64_t timeUs, List<MediaBuffer *> samples)
-            : mTrack(track), mTimeStampUs(timeUs), mSamples(samples) {
+    Chunk(Track *track, int64_t timeUs, int32_t durationTicks, MediaBuffer * samples)
+            : mTrack(track),
+            mTimeStampUs(timeUs),
+            mDurationTicks(durationTicks),
+            mSamples(samples) {
         }
 
     };
     struct ChunkInfo {
         Track               *mTrack;        // Owner
-        List<Chunk>         mChunks;        // Remaining chunks to be written
+        List<Chunk>          mChunks;       // Remaining chunks to be written
+
+        int32_t              mSampleCount;
+
+        // duration of each of the samples in this chunk for trun box
+        int64_t               mSampleDurationTicks;
+        // size of each of the samples in this chunk for trun box
+        int64_t               mSampleSize;
+
+        int64_t               mBaseMediaDecodeTimeUs;
 
         // Previous chunk timestamp that has been written
         int64_t mPrevChunkTimestampUs;
@@ -130,7 +147,7 @@ private:
     bool            mIsFirstChunk;
     volatile bool   mDone;                  // Writer thread is done?
     pthread_t       mThread;                // Thread id for the writer
-    List<ChunkInfo> mChunkInfos;            // Chunk infos
+    Vector<ChunkInfo> mChunkInfos;            // Chunk infos
     Condition       mChunkReadyCondition;   // Signal that chunks are available
 
     // Writer thread handling
@@ -176,7 +193,11 @@ private:
     void trackProgressStatus(size_t trackId, int64_t timeUs, status_t err = OK);
     void writeCompositionMatrix(int32_t degrees);
     void writeMvhdBox(int64_t durationUs);
+    void writeMvexBox();
     void writeMoovBox(int64_t durationUs);
+    void writeMfhdBox(int64_t durationUs);
+    void writeMoofBox(int64_t durationUs, Chunk &chunk);
+    void writeTrackFragmentHeader(ChunkInfo &chunkInfo, bool use32BitOffset = true);
     void writeFtypBox(MetaData *param);
     void writeUdtaBox();
     void writeGeoDataBox();
