@@ -76,12 +76,11 @@ private:
     bool mStarted;  // Writer thread + track threads started successfully
     bool mWriterThreadStarted;  // Only writer thread started successfully
     off64_t mOffset;
-    off_t mMdatOffset;
+    off64_t mDataOffsetOffset; // offset of data offset in "tfhd" box
+    int32_t mFileType;
     uint8_t *mMoovBoxBuffer;
     off64_t mMoovBoxBufferOffset;
     bool  mWriteMoovBoxToMemory;
-    off64_t mFreeBoxOffset;
-    bool mStreamableFile;
     off64_t mEstimatedMoovBoxSize;
     uint32_t mInterleaveDurationUs;
     int32_t mTimeScale;
@@ -115,7 +114,8 @@ private:
         // Convenient constructor
         Chunk(): mTrack(NULL), mTimeStampUs(0) {}
 
-    Chunk(Track *track, int64_t timeUs, int32_t durationTicks, MediaBuffer * samples)
+    Chunk(Track *track, int64_t timeUs,
+          int32_t durationTicks, MediaBuffer * samples)
             : mTrack(track),
             mTimeStampUs(timeUs),
             mDurationTicks(durationTicks),
@@ -129,7 +129,7 @@ private:
 
         int32_t              mSampleCount;
 
-        // duration of each of the samples in this chunk for trun box
+        // duration of each of the sample in this chunk for trun box
         int64_t               mSampleDurationTicks;
         // size of each of the samples in this chunk for trun box
         int64_t               mSampleSize;
@@ -198,7 +198,7 @@ private:
     void writeMfhdBox(int64_t durationUs);
     void writeMoofBox(int64_t durationUs, Chunk &chunk);
     void writeTrackFragmentHeader(ChunkInfo &chunkInfo, bool use32BitOffset = true);
-    void writeFtypBox(MetaData *param);
+    void writeFtypBox();
     void writeUdtaBox();
     void writeGeoDataBox();
     void writeLatitude(int degreex10000);
