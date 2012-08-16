@@ -86,8 +86,7 @@ MediaBuffer::MediaBuffer(const sp<ABuffer> &buffer)
 }
 
 void MediaBuffer::release() {
-    if (mObserver == NULL) {
-        CHECK_EQ(mRefCount, 0);
+    if (mRefCount == 0 && mObserver == NULL) {
         delete this;
         return;
     }
