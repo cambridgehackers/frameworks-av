@@ -35,6 +35,7 @@
 #include <cutils/properties.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -711,6 +712,10 @@ void MPEG4Writer::writeMvexBox() {
 void MPEG4Writer::writeMoovBox(int64_t durationUs) {
     ALOGD("writeMoovBox: %lld", durationUs);
     beginBox("moov");
+    beginBox("uri ");
+    int32_t r = rand();
+    writeInt32(r);
+    endBox();
     writeMvhdBox(durationUs);
     writeMvexBox();
     if (mAreGeoTagsAvailable) {
@@ -736,7 +741,14 @@ void MPEG4Writer::writeMfhdBox(int64_t durationUs) {
 
 void MPEG4Writer::writeMoofBox(int64_t durationUs, Chunk &chunk) {
     //ALOGD("writeMoofBox: %lld", durationUs);
+    struct timeval tv;
+    struct timezone tz;
+    gettimeofday(&tv, &tz);
     beginBox("moof");
+    beginBox("mfts");
+    writeInt32(tv.tv_sec);
+    writeInt32(tv.tv_usec);
+    endBox();
     writeMfhdBox(durationUs);
     for (Vector<ChunkInfo>::iterator it = mChunkInfos.begin();
          it != mChunkInfos.end(); 
@@ -821,6 +833,7 @@ void MPEG4Writer::writeFtypBox() {
     writeInt32(0);
     writeFourcc("isom");
     writeFourcc("3gp4");
+    writeFourcc("dash");
     endBox();
 }
 
@@ -1508,7 +1521,7 @@ void MPEG4Writer::threadFunc() {
             if (mUse32BitOffset) {
 
                 int32_t mdatlen = sampleSize+8;
-                mdatlen = hton32(mdatlen);
+                mdatlen = htonl(mdatlen);
 
                 memcpy(mMoovBoxBuffer+mMoovBoxBufferOffset, (char*)&mdatlen, sizeof(mdatlen));
                 mMoovBoxBufferOffset += sizeof(mdatlen);
