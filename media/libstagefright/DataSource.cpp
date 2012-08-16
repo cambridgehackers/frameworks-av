@@ -22,6 +22,7 @@
 
 #include "include/MP3Extractor.h"
 #include "include/MPEG4Extractor.h"
+#include "include/MoofExtractor.h"
 #include "include/WAVExtractor.h"
 #include "include/OggExtractor.h"
 #include "include/MPEG2PSExtractor.h"
@@ -109,6 +110,7 @@ void DataSource::RegisterSniffer(SnifferFunc func) {
 
 // static
 void DataSource::RegisterDefaultSniffers() {
+    RegisterSniffer(SniffMoof);
     RegisterSniffer(SniffMPEG4);
     RegisterSniffer(SniffMatroska);
     RegisterSniffer(SniffOgg);
