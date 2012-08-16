@@ -44,6 +44,7 @@ extern const char *MEDIA_MIMETYPE_AUDIO_FLAC;
 extern const char *MEDIA_MIMETYPE_AUDIO_AAC_ADTS;
 
 extern const char *MEDIA_MIMETYPE_CONTAINER_MPEG4;
+extern const char *MEDIA_MIMETYPE_CONTAINER_DASH;
 extern const char *MEDIA_MIMETYPE_CONTAINER_WAV;
 extern const char *MEDIA_MIMETYPE_CONTAINER_OGG;
 extern const char *MEDIA_MIMETYPE_CONTAINER_MATROSKA;
