@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#define LOG_NDEBUG 0
 #define LOG_TAG "MediaBufferGroup"
 #include <utils/Log.h>
 
@@ -55,6 +56,29 @@ void MediaBufferGroup::add_buffer(MediaBuffer *buffer) {
     mLastBuffer = buffer;
 }
 
+void MediaBufferGroup::remove_buffer(MediaBuffer *bufferToRemove)
+{
+    Mutex::Autolock autoLock(mLock);
+
+    bufferToRemove->setObserver(NULL);
+
+    MediaBuffer *prev_buffer = NULL;
+    for (MediaBuffer *buffer = mFirstBuffer;
+         buffer != NULL; buffer = buffer->nextBuffer()) {
+        if (buffer == bufferToRemove) {
+            if (prev_buffer) {
+                prev_buffer->setNextBuffer(bufferToRemove->nextBuffer());
+            }
+            if (mFirstBuffer == bufferToRemove)
+                mFirstBuffer = bufferToRemove->nextBuffer();
+            if (mLastBuffer == bufferToRemove)
+                mLastBuffer = prev_buffer;
+            break;
+        }
+        prev_buffer = buffer;
+    }
+}
+
 status_t MediaBufferGroup::acquire_buffer(MediaBuffer **out) {
     Mutex::Autolock autoLock(mLock);
 
@@ -65,7 +89,9 @@ status_t MediaBufferGroup::acquire_buffer(MediaBuffer **out) {
                 buffer->add_ref();
                 buffer->reset();
 
+                CHECK(out != NULL);
                 *out = buffer;
+                CHECK(*out != NULL);
                 goto exit;
             }
         }

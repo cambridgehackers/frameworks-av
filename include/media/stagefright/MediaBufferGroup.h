@@ -33,6 +33,7 @@ public:
     ~MediaBufferGroup();
 
     void add_buffer(MediaBuffer *buffer);
+    void remove_buffer(MediaBuffer *buffer);
 
     // Blocks until a buffer is available and returns it to the caller,
     // the returned buffer will have a reference count of 1.
