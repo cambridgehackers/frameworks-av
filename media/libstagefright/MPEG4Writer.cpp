@@ -948,24 +948,9 @@ size_t MPEG4Writer::write(
         // This happens only when we write the moov box at the end of
         // recording, not for each output video/audio frame we receive.
         off64_t moovBoxSize = 8 + mMoovBoxBufferOffset + bytes;
-        if (moovBoxSize > mEstimatedMoovBoxSize) {
-            for (List<off64_t>::iterator it = mBoxes.begin();
-                 it != mBoxes.end(); ++it) {
-                (*it) += mOffset;
-            }
-            ALOGD("lseek64 MPEG4Writer::write");
-            lseek64(mFd, mOffset, SEEK_SET);
-            ::write(mFd, mMoovBoxBuffer, mMoovBoxBufferOffset);
-            ::write(mFd, ptr, size * nmemb);
-            mOffset += (bytes + mMoovBoxBufferOffset);
-            free(mMoovBoxBuffer);
-            mMoovBoxBuffer = NULL;
-            mMoovBoxBufferOffset = 0;
-            mWriteMoovBoxToMemory = false;
-        } else {
-            memcpy(mMoovBoxBuffer + mMoovBoxBufferOffset, ptr, bytes);
-            mMoovBoxBufferOffset += bytes;
-        }
+        CHECK(moovBoxSize <= mEstimatedMoovBoxSize);
+        memcpy(mMoovBoxBuffer + mMoovBoxBufferOffset, ptr, bytes);
+        mMoovBoxBufferOffset += bytes;
     } else {
         ::write(mFd, ptr, size * nmemb);
         mOffset += bytes;
@@ -989,16 +974,9 @@ void MPEG4Writer::endBox() {
     off64_t offset = *--mBoxes.end();
     mBoxes.erase(--mBoxes.end());
 
-    if (mWriteMoovBoxToMemory) {
-       int32_t x = htonl(mMoovBoxBufferOffset - offset);
-       memcpy(mMoovBoxBuffer + offset, &x, 4);
-    } else {
-        ALOGD("lseek64 MPEG4Writer::endBox");
-        lseek64(mFd, offset, SEEK_SET);
-        writeInt32(mOffset - offset);
-        mOffset -= 4;
-        lseek64(mFd, mOffset, SEEK_SET);
-    }
+    CHECK(mWriteMoovBoxToMemory);
+    int32_t x = htonl(mMoovBoxBufferOffset - offset);
+    memcpy(mMoovBoxBuffer + offset, &x, 4);
 }
 
 void MPEG4Writer::writeInt8(int8_t x) {
