@@ -2141,6 +2141,7 @@ MoofSource::MoofSource(
 
     mIsAVC = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC);
     ALOGV("MoofSource isAVC %d %s", mIsAVC, mime);
+    mFormat->dumpToLog();
 
     if (mIsAVC) {
         uint32_t type;
