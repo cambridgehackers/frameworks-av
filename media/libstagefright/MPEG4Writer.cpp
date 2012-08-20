@@ -1398,7 +1398,7 @@ void MPEG4Writer::writeAllChunks() {
 }
 
 bool MPEG4Writer::findChunkToWrite(Chunk *chunk) {
-    ALOGV("findChunkToWrite");
+    //ALOGV("findChunkToWrite");
 
     int64_t minTimestampUs = 0x7FFFFFFFFFFFFFFFLL;
     Track *track = NULL;
@@ -1414,7 +1414,7 @@ bool MPEG4Writer::findChunkToWrite(Chunk *chunk) {
     }
 
     if (track == NULL) {
-        ALOGV("Nothing to be written after all");
+        //ALOGV("Nothing to be written after all");
         return false;
     }
 
@@ -1462,8 +1462,6 @@ void MPEG4Writer::threadFunc() {
             mChunkReadyCondition.wait(mLock);
         }
 
-        ALOGV("mDone=%d chunkFound=%d\n", mDone, chunkFound);
-
         if (chunkFound) {
 
             mWriteMoovBoxToMemory = true;
@@ -1475,7 +1473,7 @@ void MPEG4Writer::threadFunc() {
                 wroteMoovBox = true;
             }
 
-            ALOGV("Starting MOOF box mOffset=%lld mTimeStampUs=%lld durationTicks=%ld\n", 
+            ALOGV("Starting MOOF box mOffset=%lld mTimeStampUs=%lld durationTicks=%lld\n", 
                   mOffset, chunk.mTimeStampUs, chunk.mDurationTicks);
             chunkStartTimeUs = chunk.mTimeStampUs;
             ChunkInfo &chunkInfo = mChunkInfos.editItemAt(chunk.mTrack->getTrackId());
@@ -1496,9 +1494,17 @@ void MPEG4Writer::threadFunc() {
                    (char *)&fileOffset, sizeof(fileOffset));
 
             int64_t sampleSize = chunk.mSamples->range_length();
+            int32_t mdatlen = sampleSize+8;
+            if (chunk.mTrack->isAvc()) {
+                // NAL length is prepended to sample
+                if (mUse4ByteNalLength)
+                    mdatlen += 4;
+                else
+                    mdatlen += 2;
+            }
+
             if (mUse32BitOffset) {
 
-                int32_t mdatlen = sampleSize+8;
                 mdatlen = htonl(mdatlen);
 
                 memcpy(mMoovBoxBuffer+mMoovBoxBufferOffset, (char*)&mdatlen, sizeof(mdatlen));
@@ -1507,7 +1513,7 @@ void MPEG4Writer::threadFunc() {
                 mMoovBoxBufferOffset += 4;
 
             } else {
-                int64_t mdatlen = sampleSize+16;
+                mdatlen += 8;
                 mdatlen = hton64(mdatlen);
 
                 memcpy(mMoovBoxBuffer+mMoovBoxBufferOffset, "\x00\x00\x00\x01mdat", 8);
@@ -2819,6 +2825,8 @@ int32_t MPEG4Writer::Track::getStartTimeOffsetScaledTime() const {
 void MPEG4Writer::Track::writeSttsBox() {
     mOwner->beginBox("stts");
     mOwner->writeInt32(0);  // version=0, flags=0
+    ALOGV("mNumSttsTableEntries: %d", mNumSttsTableEntries);
+    mNumSttsTableEntries = 0;
     mOwner->writeInt32(mNumSttsTableEntries);
 
     if (mNumSttsTableEntries > 0) {
