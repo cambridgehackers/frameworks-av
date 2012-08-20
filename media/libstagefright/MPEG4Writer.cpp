@@ -113,43 +113,6 @@ private:
 
     size_t              mNumStcoTableEntries;
 
-    size_t              mNumStscTableEntries;
-    struct StscTableEntry {
-
-        StscTableEntry(uint32_t chunk, uint32_t samples, uint32_t id)
-            : firstChunk(chunk),
-              samplesPerChunk(samples),
-              sampleDescriptionId(id) {}
-
-        uint32_t firstChunk;
-        uint32_t samplesPerChunk;
-        uint32_t sampleDescriptionId;
-    };
-    List<StscTableEntry> mStscTableEntries;
-
-    size_t        mNumStssTableEntries;
-    List<int32_t> mStssTableEntries;
-
-    struct SttsTableEntry {
-
-        SttsTableEntry(uint32_t count, uint32_t duration)
-            : sampleCount(count), sampleDuration(duration) {}
-
-        uint32_t sampleCount;
-        uint32_t sampleDuration;  // time scale based
-    };
-    size_t        mNumSttsTableEntries;
-    List<SttsTableEntry> mSttsTableEntries;
-
-    struct CttsTableEntry {
-        CttsTableEntry(uint32_t count, int32_t timescaledDur)
-            : sampleCount(count), sampleDuration(timescaledDur) {}
-
-        uint32_t sampleCount;
-        uint32_t sampleDuration;  // time scale based
-    };
-    size_t        mNumCttsTableEntries;
-    List<CttsTableEntry> mCttsTableEntries;
     int64_t mMinCttsOffsetTimeUs;
     int64_t mMaxCttsOffsetTimeUs;
 
@@ -211,12 +174,6 @@ private:
     int32_t mRotation;
 
     void updateTrackSizeEstimate();
-    void addOneStscTableEntry(size_t chunkId, size_t sampleId);
-    void addOneStssTableEntry(size_t sampleId);
-
-    // Duration is time scale based
-    void addOneSttsTableEntry(size_t sampleCount, int32_t timescaledDur);
-    void addOneCttsTableEntry(size_t sampleCount, int32_t timescaledDur);
 
     bool isTrackMalFormed() const;
     void sendTrackSummary(bool hasMultipleTracks);
@@ -227,7 +184,6 @@ private:
     void writeStszBox();
     void writeStssBox();
     void writeSttsBox();
-    void writeCttsBox();
     void writeD263Box();
     void writePaspBox();
     void writeAvccBox();
@@ -295,6 +251,7 @@ MPEG4Writer::MPEG4Writer(int fd)
       mStartTimeOffsetMs(-1),
       mGotAllCodecSpecificData(false),
       mSequenceNumber(1) {
+    ALOGV("MPEG4Writer::MPEG4Writer");
 }
 
 MPEG4Writer::~MPEG4Writer() {
@@ -440,6 +397,7 @@ status_t MPEG4Writer::start(MetaData *param) {
         return UNKNOWN_ERROR;
     }
 
+    ALOGV("start");
     /*
      * Check mMaxFileSizeLimitBytes at the beginning
      * since mMaxFileSizeLimitBytes may be implicitly
@@ -610,13 +568,16 @@ void MPEG4Writer::writeCompositionMatrix(int degrees) {
 }
 
 void MPEG4Writer::release() {
-    close(mFd);
+    ALOGV("MPEG4Writer::release()");
+    if (mFd > 0)
+        close(mFd);
     mFd = -1;
     mInitCheck = NO_INIT;
     mStarted = false;
 }
 
 status_t MPEG4Writer::reset() {
+    ALOGV("MPEG4Writer::reset()");
     if (mInitCheck != OK) {
         return OK;
     } else {
@@ -1197,48 +1158,9 @@ void MPEG4Writer::Track::updateTrackSizeEstimate() {
     if (!mOwner->isFileStreamable()) {
         // Reserved free space is not large enough to hold
         // all meta data and thus wasted.
-        mEstimatedTrackSizeBytes += mNumStscTableEntries * 12 +  // stsc box size
-                                    mNumStssTableEntries * 4 +   // stss box size
-                                    mNumSttsTableEntries * 8 +   // stts box size
-                                    mNumCttsTableEntries * 8 +   // ctts box size
-                                    stcoBoxSizeBytes +           // stco box size
+        mEstimatedTrackSizeBytes += stcoBoxSizeBytes +           // stco box size
                                     stszBoxSizeBytes;            // stsz box size
     }
-}
-
-void MPEG4Writer::Track::addOneStscTableEntry(size_t chunkId, size_t sampleId) {
-    //ALOGV("stsc %s chunk=%d sample=%d", (mIsAudio ? "Audio" : "Video"), chunkId, sampleId);
-        StscTableEntry stscEntry(chunkId, sampleId, 1);
-        mStscTableEntries.push_back(stscEntry);
-        ++mNumStscTableEntries;
-}
-
-void MPEG4Writer::Track::addOneStssTableEntry(size_t sampleId) {
-    //ALOGV("stss %s sample=%d", (mIsAudio ? "Audio" : "Video"), sampleId);
-    mStssTableEntries.push_back(sampleId);
-    ++mNumStssTableEntries;
-}
-
-void MPEG4Writer::Track::addOneSttsTableEntry(size_t sampleCount, int32_t duration) {
-    //ALOGV("stts %s sampleCount=%d, duration=%d", (mIsAudio ? "Audio" : "Video"), sampleCount, duration);
-
-    if (duration == 0) {
-        ALOGW("0-duration samples found: %d", sampleCount);
-    }
-    SttsTableEntry sttsEntry(sampleCount, duration);
-    mSttsTableEntries.push_back(sttsEntry);
-    ++mNumSttsTableEntries;
-}
-
-void MPEG4Writer::Track::addOneCttsTableEntry(size_t sampleCount, int32_t duration) {
-    ALOGV("ctss %s sampleCount=%d, duration=%d", (mIsAudio ? "Audio" : "Video"), sampleCount, duration);
-
-    if (mIsAudio) {
-        return;
-    }
-    CttsTableEntry cttsEntry(sampleCount, duration);
-    mCttsTableEntries.push_back(cttsEntry);
-    ++mNumCttsTableEntries;
 }
 
 void MPEG4Writer::Track::addChunkOffset(off64_t offset) {
@@ -1394,6 +1316,8 @@ void MPEG4Writer::writeAllChunks() {
     sendSessionSummary();
 
     mChunkInfos.clear();
+    close(mFd);
+    mFd = -1;
     ALOGD("%d chunks are written in the last batch", outstandingChunks);
 }
 
@@ -1640,10 +1564,6 @@ status_t MPEG4Writer::Track::start(MetaData *params) {
     mReachedEOS = false;
     mEstimatedTrackSizeBytes = 0;
     mNumStcoTableEntries = 0;
-    mNumStssTableEntries = 0;
-    mNumStscTableEntries = 0;
-    mNumSttsTableEntries = 0;
-    mNumCttsTableEntries = 0;
     mMdatSizeBytes = 0;
 
     mMaxChunkDurationUs = 0;
@@ -2130,11 +2050,9 @@ status_t MPEG4Writer::Track::threadEntry() {
                 // so that we can do adjustment for the initial track start
                 // time offset easily in writeCttsBox().
                 lastCttsOffsetTimeTicks = currCttsOffsetTimeTicks;
-                addOneCttsTableEntry(1, currCttsOffsetTimeTicks);
                 cttsSampleCount = 0;      // No sample in ctts box is pending
             } else {
                 if (currCttsOffsetTimeTicks != lastCttsOffsetTimeTicks) {
-                    addOneCttsTableEntry(cttsSampleCount, lastCttsOffsetTimeTicks);
                     lastCttsOffsetTimeTicks = currCttsOffsetTimeTicks;
                     cttsSampleCount = 1;  // One sample in ctts box is pending
                 } else {
@@ -2193,7 +2111,6 @@ status_t MPEG4Writer::Track::threadEntry() {
             // Force the first sample to have its own stts entry so that
             // we can adjust its value later to maintain the A/V sync.
             if (mNumSamples == 3 || currDurationTicks != lastDurationTicks) {
-                addOneSttsTableEntry(sampleCount, lastDurationTicks);
                 sampleCount = 1;
             } else {
                 ++sampleCount;
@@ -2212,10 +2129,6 @@ status_t MPEG4Writer::Track::threadEntry() {
         lastDurationUs = timestampUs - lastTimestampUs;
         lastDurationTicks = currDurationTicks;
         lastTimestampUs = timestampUs;
-
-        if (isSync != 0) {
-            addOneStssTableEntry(mNumSamples);
-        }
 
         if (mTrackingProgressStatus) {
             if (mPreviousTrackTimeUs <= 0) {
@@ -2243,23 +2156,6 @@ status_t MPEG4Writer::Track::threadEntry() {
         ++sampleCount;  // Count for the last sample
     }
 
-    if (mNumSamples <= 2) {
-        addOneSttsTableEntry(1, lastDurationTicks);
-        if (sampleCount - 1 > 0) {
-            addOneSttsTableEntry(sampleCount - 1, lastDurationTicks);
-        }
-    } else {
-        addOneSttsTableEntry(sampleCount, lastDurationTicks);
-    }
-
-    // The last ctts box may not have been written yet, and this
-    // is to make sure that we write out the last ctts box.
-    if (currCttsOffsetTimeTicks == lastCttsOffsetTimeTicks) {
-        if (cttsSampleCount > 0) {
-            addOneCttsTableEntry(cttsSampleCount, lastCttsOffsetTimeTicks);
-        }
-    }
-
     mTrackDurationUs += lastDurationUs;
     mReachedEOS = true;
 
@@ -2280,11 +2176,6 @@ status_t MPEG4Writer::Track::threadEntry() {
 bool MPEG4Writer::Track::isTrackMalFormed() const {
     if (mSampleSizes.empty()) {                      // no samples written
         ALOGE("The number of recorded samples is 0");
-        return true;
-    }
-
-    if (!mIsAudio && mNumStssTableEntries == 0) {  // no sync frames for video
-        ALOGE("There are no sync frames for video track");
         return true;
     }
 
@@ -2473,7 +2364,6 @@ void MPEG4Writer::Track::writeStblBox(bool use32BitOffset) {
     }
     mOwner->endBox();  // stsd
     writeSttsBox();
-    writeCttsBox();
     if (!mIsAudio) {
         writeStssBox();
     }
@@ -2825,81 +2715,14 @@ int32_t MPEG4Writer::Track::getStartTimeOffsetScaledTime() const {
 void MPEG4Writer::Track::writeSttsBox() {
     mOwner->beginBox("stts");
     mOwner->writeInt32(0);  // version=0, flags=0
-    ALOGV("mNumSttsTableEntries: %d", mNumSttsTableEntries);
-    mNumSttsTableEntries = 0;
-    mOwner->writeInt32(mNumSttsTableEntries);
-
-    if (mNumSttsTableEntries > 0) {
-        // Compensate for small start time difference from different media tracks
-        List<SttsTableEntry>::iterator it = mSttsTableEntries.begin();
-        CHECK(it != mSttsTableEntries.end() && it->sampleCount == 1);
-        mOwner->writeInt32(it->sampleCount);
-        mOwner->writeInt32(getStartTimeOffsetScaledTime() + it->sampleDuration);
-
-        int64_t totalCount = 1;
-        while (++it != mSttsTableEntries.end()) {
-            mOwner->writeInt32(it->sampleCount);
-            mOwner->writeInt32(it->sampleDuration);
-            totalCount += it->sampleCount;
-        }
-        CHECK_EQ(totalCount, mNumSamples);
-    }
+    mOwner->writeInt32(0);
     mOwner->endBox();  // stts
-}
-
-void MPEG4Writer::Track::writeCttsBox() {
-    if (mIsAudio) {  // ctts is not for audio
-        return;
-    }
-
-    // There is no B frame at all
-    if (mMinCttsOffsetTimeUs == mMaxCttsOffsetTimeUs) {
-        return;
-    }
-
-    // Do not write ctts box when there is no need to have it.
-    if ((mNumCttsTableEntries == 1 &&
-        mCttsTableEntries.begin()->sampleDuration == 0) ||
-        mNumCttsTableEntries == 0) {
-        return;
-    }
-
-    ALOGD("ctts box has %d entries with range [%lld, %lld]",
-            mNumCttsTableEntries, mMinCttsOffsetTimeUs, mMaxCttsOffsetTimeUs);
-
-    mOwner->beginBox("ctts");
-    // Version 1 allows to use negative offset time value, but
-    // we are sticking to version 0 for now.
-    mOwner->writeInt32(0);  // version=0, flags=0
-    mOwner->writeInt32(mNumCttsTableEntries);
-
-    if (mNumCttsTableEntries > 0) {
-        // Compensate for small start time difference from different media tracks
-        List<CttsTableEntry>::iterator it = mCttsTableEntries.begin();
-        CHECK(it != mCttsTableEntries.end() && it->sampleCount == 1);
-        mOwner->writeInt32(it->sampleCount);
-        mOwner->writeInt32(getStartTimeOffsetScaledTime() +
-                           it->sampleDuration - mMinCttsOffsetTimeUs);
-
-        int64_t totalCount = 1;
-        while (++it != mCttsTableEntries.end()) {
-            mOwner->writeInt32(it->sampleCount);
-            mOwner->writeInt32(it->sampleDuration - mMinCttsOffsetTimeUs);
-            totalCount += it->sampleCount;
-        }
-        CHECK_EQ(totalCount, mNumSamples);
-    }
-    mOwner->endBox();  // ctts
 }
 
 void MPEG4Writer::Track::writeStssBox() {
     mOwner->beginBox("stss");
     mOwner->writeInt32(0);  // version=0, flags=0
-    mOwner->writeInt32(mNumStssTableEntries);  // number of sync frames
-    for (List<int32_t>::iterator it = mStssTableEntries.begin();
-        it != mStssTableEntries.end(); ++it) {
-        mOwner->writeInt32(*it);
-    }
+    mOwner->writeInt32(0);  // number of sync frames
     mOwner->endBox();  // stss
 }
 
@@ -2940,13 +2763,7 @@ void MPEG4Writer::Track::writeStszBox() {
 void MPEG4Writer::Track::writeStscBox() {
     mOwner->beginBox("stsc");
     mOwner->writeInt32(0);  // version=0, flags=0
-    mOwner->writeInt32(mNumStscTableEntries);
-    for (List<StscTableEntry>::iterator it = mStscTableEntries.begin();
-        it != mStscTableEntries.end(); ++it) {
-        mOwner->writeInt32(it->firstChunk);
-        mOwner->writeInt32(it->samplesPerChunk);
-        mOwner->writeInt32(it->sampleDescriptionId);
-    }
+    mOwner->writeInt32(0); // mNumStscTableEntries
     mOwner->endBox();  // stsc
 }
 
