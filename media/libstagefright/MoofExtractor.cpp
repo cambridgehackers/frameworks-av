@@ -523,7 +523,7 @@ int MoofSampleTable::readSamples()
             break;
         case FOURCC('m','d','a','t'): {
             mOffset += chunk_size;
-            //mDataSource->setCachedRange(data_offset, chunk_data_size);
+            mDataSource->setCachedRange(data_offset, chunk_data_size);
             // now read the samples
             int numSamplesRead = 0;
             for (int trackIndex = 0; trackIndex < 2; trackIndex++) {
