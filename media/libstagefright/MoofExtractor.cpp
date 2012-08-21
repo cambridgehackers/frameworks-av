@@ -44,12 +44,75 @@
 
 namespace android {
 
+static void hexdump(const void *_data, size_t size, bool ascii=false) {
+    const uint8_t *data = (const uint8_t *)_data;
+    size_t offset = 0;
+    char line[256];
+    int pos = 0;
+    while (offset < size) {
+        pos += snprintf(line+pos, sizeof(line)-pos, "0x%04x  ", offset);
+
+        size_t n = size - offset;
+        if (n > 32) {
+            n = 32;
+        }
+
+        for (size_t i = 0; i < 32; ++i) {
+            if ((i % 4) == 0) {
+                pos += snprintf(line+pos, sizeof(line)-pos, " ");
+            }
+
+            if (offset + i < size) {
+                pos += snprintf(line+pos, sizeof(line)-pos, "%02x", data[offset + i]);
+            } else {
+                pos += snprintf(line+pos, sizeof(line)-pos, "  ");
+            }
+        }
+
+        pos += snprintf(line+pos, sizeof(line)-pos, " ");
+
+        if (ascii) {
+            for (size_t i = 0; i < n; ++i) {
+                if (isprint(data[offset + i])) {
+                    pos += snprintf(line+pos, sizeof(line)-pos, "%c", data[offset + i]);
+                } else {
+                    pos += snprintf(line+pos, sizeof(line)-pos, ".");
+                }
+            }
+        }
+
+        ALOGV("%s", line);
+        pos = 0;
+
+        offset += 32;
+    }
+}
+
 static void MakeFourCCString(uint32_t x, char *s) {
     s[0] = x >> 24;
     s[1] = (x >> 16) & 0xff;
     s[2] = (x >> 8) & 0xff;
     s[3] = x & 0xff;
     s[4] = '\0';
+}
+
+size_t parseNALSize(uint32_t nalLengthSize, const uint8_t *data) {
+    switch (nalLengthSize) {
+        case 1:
+            return *data;
+        case 2:
+            return U16_AT(data);
+        case 3:
+            return ((size_t)data[0] << 16) | U16_AT(&data[1]);
+        case 4:
+            return U32_AT(data);
+    }
+
+    // This cannot happen, mNALLengthSize springs to life by adding 1 to
+    // a 2-bit integer.
+    CHECK(!"Should not be here.");
+
+    return 0;
 }
 
 // This custom data source wraps an existing one and satisfies requests
@@ -115,7 +178,7 @@ ssize_t MoofDataSource::readAt(off64_t offset, void *data, size_t size) {
     Mutex::Autolock autoLock(mLock);
 
     bool cacheHit = (offset >= mCachedOffset
-                     && offset + size <= mCachedOffset + mCachedSize);
+                     && (offset + size) <= (mCachedOffset + mCachedSize));
     ALOGV("MoofDataSource::readAt %lld size %d cached[%lld:%lld] %s",
           offset, size, mCachedOffset, mCachedOffset+mCachedSize,
           cacheHit ? "" : "miss");
@@ -164,6 +227,20 @@ status_t MoofDataSource::setCachedRange(off64_t offset, size_t size) {
 }
 
 struct MoofSample {
+    MoofSample() : sampleIndex(0), sampleSize(0), sampleOffset(0), sampleDuration(0), sampleTime(0),
+                   buffer(0) {}
+    void setBuffer(MediaBuffer *newBuffer) {
+        if (buffer)
+            buffer->release();
+        buffer = newBuffer;
+    }
+    bool hasBuffer() const { return buffer != NULL; }
+    MediaBuffer *takeBuffer() {
+        MediaBuffer *result = buffer;
+        buffer = NULL;
+        return result;
+    }
+
     uint32_t sampleIndex;
     uint32_t sampleSize;
     uint64_t sampleOffset;
@@ -172,6 +249,8 @@ struct MoofSample {
     uint32_t sampleFlags;
     uint32_t cts;
     sp<MetaData> meta;
+private:
+    MediaBuffer *buffer;
 };
 
 class MoofSampleTable : public RefBase {
@@ -183,10 +262,21 @@ public:
         memset(mLastDecodeTime, 0, sizeof(mLastDecodeTime));
         memset(mUsPerTick, 0, sizeof(mUsPerTick));
         memset(mSampleIndex, 0, sizeof(mSampleIndex));
+        for (int i = 0; i < 2; i++) {
+            mGroup[i] = new MediaBufferGroup;
+            // prime the pump
+            for (int j = 0; j < 100; j++) {
+                MediaBuffer *buffer = new MediaBuffer(1000);
+                mGroup[i]->add_buffer(buffer);
+            }
+        }
     };
     int getSample(size_t trackIndex, size_t sampleIndex, MoofSample *sample);
     int setTimeScale(size_t trackIndex, uint32_t timeScale);
+    void setTrackMetaData(size_t trackIndex, sp<MetaData> &meta) { mMetaData[trackIndex] = meta; }
 private:
+    status_t acquireBuffer(MediaBuffer **buffer, int track, uint64_t size);
+    status_t readSample(const sp<MetaData> &format, MoofSample *sample, MediaBuffer *buffer);
     int readSamples();
 
 private:
@@ -198,8 +288,182 @@ private:
     uint32_t mUsPerTick[2];
     uint64_t mLastDecodeTime[2];
     sp<MoofDataSource> mDataSource;
+    MediaBufferGroup *mGroup[2];
     uint32_t mSampleIndex[2];
+    sp<MetaData> mMetaData[2];
 };
+
+int MoofSampleTable::acquireBuffer(MediaBuffer **pbuffer, int track, uint64_t size)
+{
+    MediaBuffer *buffer;
+    status_t err = mGroup[track]->acquire_buffer(&buffer);
+    if (err != OK) {
+        CHECK(buffer == NULL);
+        *pbuffer = 0;
+        return err;
+    }
+
+    if (buffer->size() < size) {
+        do {
+            // free the smaller one
+            mGroup[track]->remove_buffer(buffer);
+            buffer->release();
+            buffer = NULL;
+            // make a big enough one
+            MediaBuffer *newBuffer = new MediaBuffer(2*size);
+            //ALOGV("newBuffer %p size() %d size %lld", newBuffer, newBuffer->size(), size);
+            mGroup[track]->add_buffer(newBuffer);
+
+            // and acquire it
+            err = mGroup[track]->acquire_buffer(&buffer);
+        } while (buffer->size() < size);
+        if (err != OK) {
+            CHECK(buffer == NULL);
+            *pbuffer = 0;
+            return err;
+        }
+    }
+
+    ALOGV("buffer %p size() %d size %lld", buffer, buffer->size(), size);
+    CHECK(buffer != NULL);
+    CHECK(buffer->size() >= size);
+
+    *pbuffer = buffer;
+    return OK;
+}
+
+status_t MoofSampleTable::readSample(const sp<MetaData> &format,
+                                     MoofSample *sample, MediaBuffer *buffer)
+{
+    sample->setBuffer(buffer);
+    uint64_t offset = sample->sampleOffset;
+    uint64_t size = sample->sampleSize;
+    bool isSyncSample = ((sample->sampleFlags & 0x00010000) == 0);
+
+    const char *mime;
+    bool success = format->findCString(kKeyMIMEType, &mime);
+    CHECK(success);
+
+    bool isAVC = !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC);
+    int32_t drm = 0;
+    bool usesDRM = (format->findInt32(kKeyIsDRM, &drm) && drm != 0);
+    int prefixLen = 0;
+    if (isAVC && !usesDRM)
+        prefixLen = 4;
+    prefixLen = 0;
+
+    ssize_t num_bytes_read =
+        mDataSource->readAt(offset, (uint8_t *)buffer->data()+prefixLen, size);
+    ALOGV("readSample offset %lld size %lld read %ld", offset, size, num_bytes_read);
+
+    if (num_bytes_read < (ssize_t)size) {
+        ALOGV("ERROR_IO num_bytes_read=%ld", num_bytes_read);
+        buffer->release();
+        buffer = NULL;
+        return ERROR_IO;
+    }
+
+
+    if (!isAVC) {
+
+        buffer->set_range(0, size);
+        buffer->meta_data()->clear();
+        buffer->meta_data()->setInt64(kKeyTime, sample->sampleTime);
+
+        uint64_t targetSampleTimeUs = sample->sampleTime;
+        buffer->meta_data()->setInt64(
+            kKeyTargetTime, targetSampleTimeUs);
+
+        if (isSyncSample) {
+            buffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
+        }
+
+        return OK;
+    } else {
+        // Whole NAL units are returned but each fragment is prefixed by
+        // the start code (0x00 00 00 01).
+
+        uint32_t nalLengthSize = 0;
+        {
+            uint32_t type;
+            const void *data;
+            size_t size;
+            CHECK(format->findData(kKeyAVCC, &type, &data, &size));
+
+            const uint8_t *ptr = (const uint8_t *)data;
+
+            CHECK(size >= 7);
+            CHECK_EQ((unsigned)ptr[0], 1u);  // configurationVersion == 1
+
+            // The number of bytes used to encode the length of a NAL unit.
+            nalLengthSize = 1 + (ptr[4] & 3);
+        }
+
+        if (usesDRM) {
+            CHECK(buffer != NULL);
+            buffer->set_range(0, size);
+
+        } else {
+            const uint8_t *srcBuffer = (const uint8_t *)buffer->data()+prefixLen;
+            size_t srcOffset = 0;
+            size_t numNalUnits = 0;
+
+            bool isMalFormed = (srcOffset + nalLengthSize > size);
+            size_t nalLength = 0;
+            if (!isMalFormed) {
+                nalLength = parseNALSize(nalLengthSize, &srcBuffer[srcOffset]);
+                srcOffset += nalLengthSize;
+                isMalFormed = srcOffset + nalLength > size;
+            }
+            ALOGV("%s:%d isMalFormed %d nalLengthSize %d nalLength %d srcOffset %d size %lld", __FILE__, __LINE__,
+                  isMalFormed, nalLengthSize, nalLength, srcOffset, size);
+
+            if (isMalFormed) {
+                ALOGE("Video is malformed");
+                //buffer->release();
+                //buffer = NULL;
+                //return ERROR_MALFORMED;
+            }
+
+            //CHECK(nalLength != 0);
+            uint8_t *dstData = (uint8_t *)buffer->data();
+            size_t dstOffset = 0;
+            CHECK(dstOffset + 4 <= buffer->size());
+
+            dstData[dstOffset++] = 0;
+            dstData[dstOffset++] = 0;
+            dstData[dstOffset++] = 0;
+            dstData[dstOffset++] = 1;
+
+            srcOffset += nalLength;
+            dstOffset += nalLength;
+            numNalUnits++;
+
+            ALOGV("copied %d nal units %lld bytes", numNalUnits, size+prefixLen);
+            //CHECK_EQ(srcOffset, size);
+            CHECK(buffer != NULL);
+            //buffer->set_range(0, dstOffset);
+            CHECK(size+prefixLen <= buffer->size());
+            buffer->set_range(0, size+prefixLen);
+            //hexdump(buffer->data(), size+prefixLen);
+        }
+
+        buffer->meta_data()->clear();
+        buffer->meta_data()->setInt64(kKeyTime, sample->sampleTime);
+
+        // FIXME
+        int64_t targetSampleTimeUs = sample->sampleTime;
+        if (targetSampleTimeUs >= 0) {
+            buffer->meta_data()->setInt64(kKeyTargetTime, targetSampleTimeUs);
+        }
+
+        if (isSyncSample) {
+            buffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
+        }
+
+        return OK;
+    }
+}
 
 int MoofSampleTable::readSamples()
 {
@@ -218,7 +482,7 @@ int MoofSampleTable::readSamples()
     while (!done) {
         uint32_t hdr[2];
         if (mDataSource->readAt(mOffset, hdr, 8) < 8) {
-            ALOGV("short read @ %lld", mOffset);
+            ALOGE("short read @ %lld %llx", mOffset, mOffset);
             return ERROR_IO;
         }
         uint64_t chunk_size = ntohl(hdr[0]);
@@ -250,7 +514,7 @@ int MoofSampleTable::readSamples()
 
         switch(chunk_type) {
         case FOURCC('m','o','o','f'):
-            mDataSource->setCachedRange(data_offset, chunk_data_size);
+            //mDataSource->setCachedRange(data_offset, chunk_data_size);
             mOffset = data_offset;
             break;
         case FOURCC('t','r','a','f'):
@@ -259,8 +523,27 @@ int MoofSampleTable::readSamples()
             break;
         case FOURCC('m','d','a','t'): {
             mOffset += chunk_size;
-            mDataSource->setCachedRange(data_offset, chunk_data_size);
+            //mDataSource->setCachedRange(data_offset, chunk_data_size);
             // now read the samples
+            int numSamplesRead = 0;
+            for (int trackIndex = 0; trackIndex < 2; trackIndex++) {
+                //ALOGV("track %d samples %d", trackIndex, samples[trackIndex].size());
+                for (List<MoofSample>::iterator it = samples[trackIndex].begin();
+                     it != samples[trackIndex].end(); ++it) {
+                    MoofSample &sample = *it;
+                    uint64_t sampleOffset = sample.sampleOffset;
+                    if (sampleOffset >= data_offset
+                        && sampleOffset < data_offset + chunk_data_size) {
+                        MediaBuffer *buffer;
+                        acquireBuffer(&buffer, trackIndex, chunk_data_size);
+                        ALOGD("read track %d sample %d", trackIndex, sample.sampleIndex);
+                        readSample(mMetaData[trackIndex], &sample, buffer);
+                        numSamplesRead++;
+                    }
+                }
+            }
+            if (!numSamplesRead)
+                ALOGE("read %d samples at offset %lld", numSamplesRead, data_offset);
             return OK;
         } break;
         case FOURCC('m','f','t','s'):
@@ -393,18 +676,28 @@ int MoofSampleTable::readSamples()
 int MoofSampleTable::getSample(size_t trackIndex, size_t sampleIndex, MoofSample *sample)
 {
     CHECK(trackIndex < 2);
-    Mutex::Autolock autoLock(mLock);
 
-    if (samples[trackIndex].size() == 0)
-        readSamples();
-    for (List<MoofSample>::iterator it = samples[trackIndex].begin();
-         it != samples[trackIndex].end(); ++it) {
-        if (it->sampleIndex == sampleIndex) {
-            *sample = *it;
-            samples[trackIndex].erase(it);
-            return OK;
+    int numTries = 0;
+    do {
+        if (samples[trackIndex].size() == 0)
+            readSamples();
+        for (List<MoofSample>::iterator it = samples[trackIndex].begin();
+             it != samples[trackIndex].end(); ++it) {
+            if (it->sampleIndex == sampleIndex) {
+                *sample = *it;
+                ALOGD("got track %d sample %d buffer %d", trackIndex, sampleIndex, sample->hasBuffer());
+                samples[trackIndex].erase(it);
+                return OK;
+            }
+            if (it->sampleIndex < sampleIndex) {
+                ALOGD("discarding track %d sample %d", trackIndex, it->sampleIndex);
+                MediaBuffer *mb = it->takeBuffer();
+                if (mb)
+                    mb->release();
+                samples[trackIndex].erase(it);
+            }
         }
-    }
+    } while (numTries++ < 50);
     ALOGE("track %d sample %d out of range ", trackIndex, sampleIndex);
     return -1;    
 }
@@ -464,52 +757,11 @@ private:
     uint8_t *mSrcBuffer;
     size_t   mSrcBufferSize;
 
-    size_t parseNALSize(const uint8_t *data) const;
-
     MoofSource(const MoofSource &);
     MoofSource &operator=(const MoofSource &);
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-
-static void hexdump(const void *_data, size_t size) {
-    const uint8_t *data = (const uint8_t *)_data;
-    size_t offset = 0;
-    while (offset < size) {
-        printf("0x%04x  ", offset);
-
-        size_t n = size - offset;
-        if (n > 16) {
-            n = 16;
-        }
-
-        for (size_t i = 0; i < 16; ++i) {
-            if (i == 8) {
-                printf(" ");
-            }
-
-            if (offset + i < size) {
-                printf("%02x ", data[offset + i]);
-            } else {
-                printf("   ");
-            }
-        }
-
-        printf(" ");
-
-        for (size_t i = 0; i < n; ++i) {
-            if (isprint(data[offset + i])) {
-                printf("%c", data[offset + i]);
-            } else {
-                printf(".");
-            }
-        }
-
-        printf("\n");
-
-        offset += 16;
-    }
-}
 
 static const char *FourCC2MIME(uint32_t fourcc) {
     switch (fourcc) {
@@ -543,6 +795,7 @@ MoofExtractor::MoofExtractor(const sp<DataSource> &source)
     : mDataSource(new MoofDataSource(source)),
       mInitCheck(NO_INIT),
       mHasVideo(false),
+      mNumTracks(0),
       mFirstTrack(NULL),
       mLastTrack(NULL),
       mFileMetaData(new MetaData),
@@ -664,7 +917,7 @@ status_t MoofExtractor::readMetaData()
     size_t track_index = 0;
     while (track) {
         mMoofSampleTable->setTimeScale(track_index, track->timescale);
-
+        mMoofSampleTable->setTrackMetaData(track_index, track->meta);
         track_index++;
         track = track->next;
     }
@@ -712,7 +965,8 @@ int32_t MoofExtractor::readSize(off64_t offset,
     return size;
 }
 
-status_t MoofExtractor::parseDrmSINF(off64_t *offset, off64_t data_offset) {
+status_t MoofExtractor::parseDrmSINF(off64_t *offset, off64_t data_offset)
+{
     uint8_t updateIdTag;
     if (mDataSource->readAt(data_offset, &updateIdTag, 1) < 1) {
         return ERROR_IO;
@@ -984,12 +1238,14 @@ status_t MoofExtractor::parseChunk(off64_t *offset, int depth) {
                     mFirstTrack = track;
                 }
                 mLastTrack = track;
+                mNumTracks++;
 
                 track->meta = new MetaData;
                 track->includes_expensive_metadata = false;
                 track->skipTrack = false;
                 track->timescale = 0;
                 track->meta->setCString(kKeyMIMEType, "application/octet-stream");
+
             }
 
             off64_t stop_offset = *offset + chunk_size;
@@ -2177,6 +2433,7 @@ status_t MoofSource::start(MetaData *params) {
     } else {
         mWantsNALFragments = false;
     }
+    CHECK(!mWantsNALFragments);
 
     mGroup = new MediaBufferGroup;
 
@@ -2226,25 +2483,6 @@ sp<MetaData> MoofSource::getFormat() {
     return mFormat;
 }
 
-size_t MoofSource::parseNALSize(const uint8_t *data) const {
-    switch (mNALLengthSize) {
-        case 1:
-            return *data;
-        case 2:
-            return U16_AT(data);
-        case 3:
-            return ((size_t)data[0] << 16) | U16_AT(&data[1]);
-        case 4:
-            return U32_AT(data);
-    }
-
-    // This cannot happen, mNALLengthSize springs to life by adding 1 to
-    // a 2-bit integer.
-    CHECK(!"Should not be here.");
-
-    return 0;
-}
-
 status_t MoofSource::read(
         MediaBuffer **out, const ReadOptions *options)
 {
@@ -2253,7 +2491,7 @@ status_t MoofSource::read(
     CHECK(mStarted);
 
     uint64_t cur = mTimeSource.getRealTimeUs();
-    ALOGV("MoofSource::read track %d sample %d cur %lld (us) delta %lld (us)",
+    ALOGD("MoofSource::read track %d sample %d cur %lld (us) delta %lld (us)",
           mTrackIndex, mCurrentSampleIndex, cur, cur - mLastTimeReadUs);
     mLastTimeReadUs = cur;
 
@@ -2273,222 +2511,35 @@ status_t MoofSource::read(
     size_t size;
     uint32_t cts = 0;
     bool isSyncSample = false;
-    bool newBuffer = false;
     int err;
-    if (mBuffer == NULL) {
-        newBuffer = true;
+    CHECK(mBuffer == NULL);
 
 
-        bool found = false;
-        err = -1;
-        MoofSample sample;
-        err = mSampleTable->getSample(mTrackIndex, mCurrentSampleIndex, &sample);
-        offset = sample.sampleOffset;
-        size = sample.sampleSize;
-        cts = sample.sampleTime;
-        targetSampleTimeUs = sample.sampleTime;
-        isSyncSample = ((sample.sampleFlags & 0x00010000) == 0);
-        found = true;
+    bool found = false;
+    err = -1;
+    MoofSample sample;
+    err = mSampleTable->getSample(mTrackIndex, mCurrentSampleIndex, &sample);
+    offset = sample.sampleOffset;
+    size = sample.sampleSize;
+    cts = sample.sampleTime;
+    targetSampleTimeUs = sample.sampleTime;
+    isSyncSample = ((sample.sampleFlags & 0x00010000) == 0);
+    found = true;
 
-        ALOGV("track %d sample %d offset %lld size %d time %lld err %d",
-              mTrackIndex, mCurrentSampleIndex, offset, size, targetSampleTimeUs, err);
+    mBuffer = sample.takeBuffer();
 
-        if (err != OK) {
-            return err;
-        }
+    ALOGV("track %d sample %d offset %lld size %d time %lld err %d",
+          mTrackIndex, mCurrentSampleIndex, offset, size, targetSampleTimeUs, err);
 
-        err = mGroup->acquire_buffer(&mBuffer);
-        if (err != OK) {
-            CHECK(mBuffer == NULL);
-            return err;
-        }
-
-        if (mBuffer->size() < size) {
-            // free the smaller one
-            mGroup->remove_buffer(mBuffer);
-            mBuffer->release();
-            mBuffer = NULL;
-            // make a big enough one
-            MediaBuffer *newBuffer = new MediaBuffer(2*size);
-            ALOGV("newBuffer %p size() %d size %d", newBuffer, newBuffer->size(), size);
-            mGroup->add_buffer(newBuffer);
-
-            // and acquire it
-            err = mGroup->acquire_buffer(&mBuffer);
-            if (err != OK) {
-                CHECK(mBuffer == NULL);
-                return err;
-            } else {
-                ALOGV("mBuffer %p size() %d size %d", mBuffer, mBuffer->size(), size);
-                CHECK(mBuffer != NULL);
-                CHECK(mBuffer->size() >= size);
-            }
-        }
-        if (0)
-        ALOGV("acquired buffer err=%d mIsAVC=%d mWantsNALFragments=%x mBuffer %p",
-              err, mIsAVC, mWantsNALFragments, mBuffer);
+    if (err != OK) {
+        return err;
     }
 
-    if (!mIsAVC || mWantsNALFragments) {
-        if (newBuffer) {
-            ssize_t num_bytes_read =
-                mDataSource->readAt(offset, (uint8_t *)mBuffer->data(), size);
+    ++mCurrentSampleIndex;
+    *out = mBuffer;
+    mBuffer = NULL;
 
-            if (num_bytes_read < (ssize_t)size) {
-                ALOGV("ERROR_IO num_bytes_read=%ld", num_bytes_read);
-                //mBuffer->release();
-                mBuffer = NULL;
-                return ERROR_IO;
-            }
-
-            CHECK(mBuffer != NULL);
-            mBuffer->set_range(0, size);
-            mBuffer->meta_data()->clear();
-            mBuffer->meta_data()->setInt64(kKeyTime, cts);
-
-            if (targetSampleTimeUs >= 0) {
-                mBuffer->meta_data()->setInt64(
-                        kKeyTargetTime, targetSampleTimeUs);
-            }
-
-            if (isSyncSample) {
-                mBuffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
-            }
-        }
-
-        if (!mIsAVC) {
-            ++mCurrentSampleIndex;
-            *out = mBuffer;
-            mBuffer = NULL;
-
-            return OK;
-        }
-
-        // Each NAL unit is split up into its constituent fragments and
-        // each one of them returned in its own buffer.
-
-        CHECK(mBuffer->range_length() >= mNALLengthSize);
-
-        const uint8_t *src =
-            (const uint8_t *)mBuffer->data() + mBuffer->range_offset();
-
-        size_t nal_size = parseNALSize(src);
-        if (mBuffer->range_length() < mNALLengthSize + nal_size) {
-            ALOGE("incomplete NAL unit.");
-
-            mBuffer->release();
-            mBuffer = NULL;
-
-            return ERROR_MALFORMED;
-        }
-
-        ALOGV("cloned buffer");
-        MediaBuffer *clone = mBuffer->clone();
-        CHECK(clone != NULL);
-        clone->set_range(mBuffer->range_offset() + mNALLengthSize, nal_size);
-
-        CHECK(mBuffer != NULL);
-        mBuffer->set_range(
-                mBuffer->range_offset() + mNALLengthSize + nal_size,
-                mBuffer->range_length() - mNALLengthSize - nal_size);
-
-        if (mBuffer->range_length() == 0) {
-            mBuffer->release();
-            mBuffer = NULL;
-        }
-
-        *out = clone;
-
-        return OK;
-    } else {
-        // Whole NAL units are returned but each fragment is prefixed by
-        // the start code (0x00 00 00 01).
-        ssize_t num_bytes_read = 0;
-        int32_t drm = 0;
-        bool usesDRM = (mFormat->findInt32(kKeyIsDRM, &drm) && drm != 0);
-        if (usesDRM) {
-            num_bytes_read =
-                mDataSource->readAt(offset, (uint8_t*)mBuffer->data(), size);
-        } else {
-            if (size > mSrcBufferSize) {
-                delete mSrcBuffer;
-                mSrcBufferSize = 2*size;
-                mSrcBuffer = new uint8_t[mSrcBufferSize];
-            }
-            num_bytes_read = mDataSource->readAt(offset, mSrcBuffer, size);
-        }
-
-        if (num_bytes_read < (ssize_t)size) {
-            ALOGV("%s:%d num_bytes_read %ld size %d", __FILE__, __LINE__, num_bytes_read, size);
-            mBuffer->release();
-            mBuffer = NULL;
-
-            return ERROR_IO;
-        }
-
-        if (usesDRM) {
-            CHECK(mBuffer != NULL);
-            mBuffer->set_range(0, size);
-
-        } else {
-            uint8_t *dstData = (uint8_t *)mBuffer->data();
-            size_t srcOffset = 0;
-            size_t dstOffset = 0;
-            size_t numNalUnits = 0;
-            while (srcOffset < size) {
-                bool isMalFormed = (srcOffset + mNALLengthSize > size);
-                size_t nalLength = 0;
-                if (!isMalFormed) {
-                    nalLength = parseNALSize(&mSrcBuffer[srcOffset]);
-                    srcOffset += mNALLengthSize;
-                    isMalFormed = srcOffset + nalLength > size;
-                }
-
-                if (isMalFormed) {
-                    ALOGE("Video is malformed");
-                    mBuffer->release();
-                    mBuffer = NULL;
-                    return ERROR_MALFORMED;
-                }
-
-                if (nalLength == 0) {
-                    continue;
-                }
-
-                CHECK(dstOffset + 4 <= mBuffer->size());
-
-                dstData[dstOffset++] = 0;
-                dstData[dstOffset++] = 0;
-                dstData[dstOffset++] = 0;
-                dstData[dstOffset++] = 1;
-                memcpy(&dstData[dstOffset], &mSrcBuffer[srcOffset], nalLength);
-                srcOffset += nalLength;
-                dstOffset += nalLength;
-                numNalUnits++;
-            }
-            ALOGV("copied %d nal units %d bytes", numNalUnits, srcOffset);
-            CHECK_EQ(srcOffset, size);
-            CHECK(mBuffer != NULL);
-            mBuffer->set_range(0, dstOffset);
-        }
-
-        mBuffer->meta_data()->clear();
-        mBuffer->meta_data()->setInt64(kKeyTime, cts);
-
-        if (targetSampleTimeUs >= 0) {
-            mBuffer->meta_data()->setInt64(kKeyTargetTime, targetSampleTimeUs);
-        }
-
-        if (isSyncSample) {
-            mBuffer->meta_data()->setInt32(kKeyIsSyncFrame, 1);
-        }
-
-        ++mCurrentSampleIndex;
-        *out = mBuffer;
-        mBuffer = NULL;
-
-        return OK;
-    }
+    return OK;
 }
 
 MoofExtractor::Track *MoofExtractor::findTrackByMimePrefix(

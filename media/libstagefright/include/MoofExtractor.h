@@ -64,6 +64,7 @@ private:
     status_t mInitCheck;
     bool mHasVideo;
 
+    int mNumTracks;
     Track *mFirstTrack, *mLastTrack;
     uint64_t mOffset;
 
