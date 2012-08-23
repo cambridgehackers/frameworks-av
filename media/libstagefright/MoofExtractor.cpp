@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#define LOG_NDEBUG 0
+//#define LOG_NDEBUG 0
 #define LOG_TAG "MOOFExtractor"
 #include <utils/Log.h>
 
@@ -28,6 +28,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <pthread.h>
+#include <semaphore.h>
 
 #include <media/stagefright/foundation/ABitReader.h>
 #include <media/stagefright/foundation/ADebug.h>
@@ -44,12 +47,13 @@
 
 namespace android {
 
-static void hexdump(const void *_data, size_t size, bool ascii=false) {
+    static void hexdump(const char *prefix, const void *_data, size_t size, bool ascii=false) {
     const uint8_t *data = (const uint8_t *)_data;
     size_t offset = 0;
-    char line[256];
+    char line[512];
     int pos = 0;
     while (offset < size) {
+        pos += snprintf(line+pos, sizeof(line)-pos, "%s", prefix);
         pos += snprintf(line+pos, sizeof(line)-pos, "0x%04x  ", offset);
 
         size_t n = size - offset;
@@ -86,6 +90,7 @@ static void hexdump(const void *_data, size_t size, bool ascii=false) {
 
         offset += 32;
     }
+    ALOGV("%s hexdump offset %d(0x%x) size %d", prefix, offset, offset, size);
 }
 
 static void MakeFourCCString(uint32_t x, char *s) {
@@ -131,6 +136,7 @@ struct MoofDataSource : public DataSource {
     virtual uint32_t flags();
 
     status_t setCachedRange(off64_t offset, size_t size);
+    void clearCache();
 
 protected:
     virtual ~MoofDataSource();
@@ -142,8 +148,6 @@ private:
     off64_t mCachedOffset;
     size_t mCachedSize;
     uint8_t *mCache;
-
-    void clearCache();
 
     MoofDataSource(const MoofDataSource &);
     MoofDataSource &operator=(const MoofDataSource &);
@@ -255,34 +259,28 @@ private:
 
 class MoofSampleTable : public RefBase {
 public:
-    MoofSampleTable(uint64_t offset, sp<MoofDataSource> &dataSource)
-        : mOffset(offset)
-        , mDataSource(dataSource) {
-        memset(mTrackIndexes, 0, sizeof(mTrackIndexes));
-        memset(mLastDecodeTime, 0, sizeof(mLastDecodeTime));
-        memset(mUsPerTick, 0, sizeof(mUsPerTick));
-        memset(mSampleIndex, 0, sizeof(mSampleIndex));
-        for (int i = 0; i < 2; i++) {
-            mGroup[i] = new MediaBufferGroup;
-            // prime the pump
-            for (int j = 0; j < 100; j++) {
-                MediaBuffer *buffer = new MediaBuffer(1000);
-                mGroup[i]->add_buffer(buffer);
-            }
-        }
-    };
+    MoofSampleTable(uint64_t offset, sp<MoofDataSource> &dataSource);
+    ~MoofSampleTable();
     int getSample(size_t trackIndex, size_t sampleIndex, MoofSample *sample);
     int setTimeScale(size_t trackIndex, uint32_t timeScale);
     void setTrackMetaData(size_t trackIndex, sp<MetaData> &meta) { mMetaData[trackIndex] = meta; }
+    void onMetaDataReady();
 private:
     status_t acquireBuffer(MediaBuffer **buffer, int track, uint64_t size);
     status_t readSample(const sp<MetaData> &format, MoofSample *sample, MediaBuffer *buffer);
     int readSamples();
 
-private:
-    Mutex mLock;
+    static void *threadWrapper(void *me);
+    void run();
 
-    List<MoofSample> samples[2];
+private:
+    Mutex mSampleLock[2];
+    pthread_t mThread;
+    sem_t mProducerSemaphore;
+    sem_t mConsumerSemaphore;
+    bool  mDone;
+
+    List<MoofSample> mSamples[2];
     size_t mTrackIndexes[2];
     uint64_t mOffset;
     uint32_t mUsPerTick[2];
@@ -293,38 +291,73 @@ private:
     sp<MetaData> mMetaData[2];
 };
 
-int MoofSampleTable::acquireBuffer(MediaBuffer **pbuffer, int track, uint64_t size)
+MoofSampleTable::MoofSampleTable(uint64_t offset, sp<MoofDataSource> &dataSource)
+    : mOffset(offset)
+    , mDataSource(dataSource)
 {
-    MediaBuffer *buffer;
-    status_t err = mGroup[track]->acquire_buffer(&buffer);
-    if (err != OK) {
-        CHECK(buffer == NULL);
-        *pbuffer = 0;
-        return err;
-    }
+    sem_init(&mConsumerSemaphore, 0, 1);
+    sem_init(&mProducerSemaphore, 0, 0);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    ALOGV("starting thread");
+    mDone = false;
+    pthread_create(&mThread, &attr, threadWrapper, this);
+    pthread_attr_destroy(&attr);
 
-    if (buffer->size() < size) {
-        do {
-            // free the smaller one
-            mGroup[track]->remove_buffer(buffer);
-            buffer->release();
-            buffer = NULL;
-            // make a big enough one
-            MediaBuffer *newBuffer = new MediaBuffer(2*size);
-            //ALOGV("newBuffer %p size() %d size %lld", newBuffer, newBuffer->size(), size);
-            mGroup[track]->add_buffer(newBuffer);
-
-            // and acquire it
-            err = mGroup[track]->acquire_buffer(&buffer);
-        } while (buffer->size() < size);
-        if (err != OK) {
-            CHECK(buffer == NULL);
-            *pbuffer = 0;
-            return err;
+    memset(mTrackIndexes, 0, sizeof(mTrackIndexes));
+    memset(mLastDecodeTime, 0, sizeof(mLastDecodeTime));
+    memset(mUsPerTick, 0, sizeof(mUsPerTick));
+    memset(mSampleIndex, 0, sizeof(mSampleIndex));
+    for (int i = 0; i < 2; i++) {
+        mGroup[i] = new MediaBufferGroup;
+        // prime the pump
+        for (int j = 0; j < 100; j++) {
+            MediaBuffer *buffer = new MediaBuffer(1000);
+            mGroup[i]->add_buffer(buffer);
         }
     }
+}
 
-    ALOGV("buffer %p size() %d size %lld", buffer, buffer->size(), size);
+MoofSampleTable::~MoofSampleTable()
+{
+    mDone = true;
+    void *ret;
+    ALOGV("~MoofSampleTable: pthread_joining ...");
+    pthread_join(mThread, &ret);
+    ALOGV("~MoofSampleTable: thread done");
+
+    sem_destroy(&mConsumerSemaphore);
+    sem_destroy(&mProducerSemaphore);
+}
+
+void MoofSampleTable::onMetaDataReady()
+{
+    sem_post(&mProducerSemaphore);
+}
+
+void *MoofSampleTable::threadWrapper(void *self)
+{
+    MoofSampleTable *sampleTable = static_cast<MoofSampleTable *>(self);
+    sampleTable->run();
+    return NULL;
+}
+
+void MoofSampleTable::run()
+{
+    while (1) {
+        ALOGV("MoofSampleTable::run() waiting for producer semaphore");
+        sem_wait(&mProducerSemaphore);
+        ALOGV("MoofSampleTable::run() producer semaphore proceeding");
+        readSamples();
+        sem_post(&mConsumerSemaphore);
+    }
+}
+
+int MoofSampleTable::acquireBuffer(MediaBuffer **pbuffer, int track, uint64_t size)
+{
+    MediaBuffer *buffer = new MediaBuffer(size);;
+    ALOGV("buffer %p size() %d size %lld sample lock %d", buffer, buffer->size(), size, track);
     CHECK(buffer != NULL);
     CHECK(buffer->size() >= size);
 
@@ -335,6 +368,7 @@ int MoofSampleTable::acquireBuffer(MediaBuffer **pbuffer, int track, uint64_t si
 status_t MoofSampleTable::readSample(const sp<MetaData> &format,
                                      MoofSample *sample, MediaBuffer *buffer)
 {
+    ALOGV("readSample format=%p sample=%p buffer=%p\n", &format, sample, buffer);
     sample->setBuffer(buffer);
     uint64_t offset = sample->sampleOffset;
     uint64_t size = sample->sampleSize;
@@ -350,10 +384,9 @@ status_t MoofSampleTable::readSample(const sp<MetaData> &format,
     int prefixLen = 0;
     if (isAVC && !usesDRM)
         prefixLen = 4;
-    prefixLen = 0;
 
     ssize_t num_bytes_read =
-        mDataSource->readAt(offset, (uint8_t *)buffer->data()+prefixLen, size);
+        mDataSource->readAt(offset, (uint8_t *)buffer->data(), size);
     ALOGV("readSample offset %lld size %lld read %ld", offset, size, num_bytes_read);
 
     if (num_bytes_read < (ssize_t)size) {
@@ -404,7 +437,7 @@ status_t MoofSampleTable::readSample(const sp<MetaData> &format,
             buffer->set_range(0, size);
 
         } else {
-            const uint8_t *srcBuffer = (const uint8_t *)buffer->data()+prefixLen;
+            const uint8_t *srcBuffer = (const uint8_t *)buffer->data();
             size_t srcOffset = 0;
             size_t numNalUnits = 0;
 
@@ -426,7 +459,9 @@ status_t MoofSampleTable::readSample(const sp<MetaData> &format,
             }
 
             //CHECK(nalLength != 0);
-            uint8_t *dstData = (uint8_t *)buffer->data();
+            CHECK(nalLengthSize == prefixLen);
+            // overwrite NAL length with start code 00 00 00 01
+            uint8_t *dstData = (uint8_t *)buffer->data(); //+prefixLen-nalLengthSize;
             size_t dstOffset = 0;
             CHECK(dstOffset + 4 <= buffer->size());
 
@@ -435,16 +470,16 @@ status_t MoofSampleTable::readSample(const sp<MetaData> &format,
             dstData[dstOffset++] = 0;
             dstData[dstOffset++] = 1;
 
-            srcOffset += nalLength;
-            dstOffset += nalLength;
             numNalUnits++;
 
-            ALOGV("copied %d nal units %lld bytes", numNalUnits, size+prefixLen);
+            //ALOGV("copied %d nal units %lld bytes", numNalUnits, size-nalLengthSize+prefixLen);
             //CHECK_EQ(srcOffset, size);
             CHECK(buffer != NULL);
-            //buffer->set_range(0, dstOffset);
-            CHECK(size+prefixLen <= buffer->size());
-            buffer->set_range(0, size+prefixLen);
+            CHECK(size <= buffer->size());
+            buffer->set_range(0, size);
+            if (1)
+            ALOGV("set_range prefixLen %d nalLengthSize %d offset %d size %lld buffer size %d",
+                  prefixLen, nalLengthSize, 0, size, buffer->size());
             //hexdump(buffer->data(), size+prefixLen);
         }
 
@@ -467,8 +502,9 @@ status_t MoofSampleTable::readSample(const sp<MetaData> &format,
 
 int MoofSampleTable::readSamples()
 {
+    
     bool done = false;
-    uint32_t track_index = 0;
+    uint32_t trackIndex = 0;
 
     uint32_t sampleCount = 0;
     uint32_t defaultSampleDuration = 0;
@@ -514,7 +550,7 @@ int MoofSampleTable::readSamples()
 
         switch(chunk_type) {
         case FOURCC('m','o','o','f'):
-            //mDataSource->setCachedRange(data_offset, chunk_data_size);
+            mDataSource->setCachedRange(data_offset, chunk_data_size);
             mOffset = data_offset;
             break;
         case FOURCC('t','r','a','f'):
@@ -527,21 +563,34 @@ int MoofSampleTable::readSamples()
             // now read the samples
             int numSamplesRead = 0;
             for (int trackIndex = 0; trackIndex < 2; trackIndex++) {
-                //ALOGV("track %d samples %d", trackIndex, samples[trackIndex].size());
-                for (List<MoofSample>::iterator it = samples[trackIndex].begin();
-                     it != samples[trackIndex].end(); ++it) {
+                //ALOGV("track %d samples %d", trackIndex, mSamples[trackIndex].size());
+
+                ALOGV("%s:%d: locking sample lock %d", __FILE__, __LINE__, trackIndex);
+		mSampleLock[trackIndex].lock();
+
+                for (List<MoofSample>::iterator it = mSamples[trackIndex].begin();
+                     it != mSamples[trackIndex].end(); ++it) {
                     MoofSample &sample = *it;
                     uint64_t sampleOffset = sample.sampleOffset;
                     if (sampleOffset >= data_offset
                         && sampleOffset < data_offset + chunk_data_size) {
                         MediaBuffer *buffer;
+
+                        ALOGV("sample lock %d acquiring buffer", trackIndex);
                         acquireBuffer(&buffer, trackIndex, chunk_data_size);
-                        ALOGD("read track %d sample %d", trackIndex, sample.sampleIndex);
+
+                        ALOGV("sample lock %d read sample %d", trackIndex, sample.sampleIndex);
                         readSample(mMetaData[trackIndex], &sample, buffer);
+
                         numSamplesRead++;
                     }
                 }
+
+                ALOGV("%s:%d: unlocking sample lock %d", __FILE__, __LINE__, trackIndex);
+                mSampleLock[trackIndex].unlock();
+
             }
+            mDataSource->clearCache();
             if (!numSamplesRead)
                 ALOGE("read %d samples at offset %lld", numSamplesRead, data_offset);
             return OK;
@@ -560,8 +609,10 @@ int MoofSampleTable::readSamples()
             uint32_t flags = ntohl(box[0]);
             switch (chunk_type) {
             case FOURCC('t','f','h','d'): {
-                track_index = ntohl(box[1])-1;
-                CHECK(track_index < 2);
+                trackIndex = ntohl(box[1])-1;
+                if (trackIndex >= 2)
+                    ALOGE("trackIndex %d out of range", trackIndex);
+                CHECK(trackIndex < 2);
                 enum tfhd_flags {
                     tfhd_default                         = 0x000000,
                     tfhd_base_data_offset_present        = 0x000001,
@@ -590,7 +641,7 @@ int MoofSampleTable::readSamples()
                 }
                 if (1)
                 ALOGV("tfhd %lld flags %d trackIndex=%x dataOffset=%lld",
-                      chunk_size, flags, track_index, sampleDataOffset);
+                      chunk_size, flags, trackIndex, sampleDataOffset);
             } break;
             case FOURCC('t','r','u','n'): {
                 sampleCount = ntohl(box[1]);
@@ -623,9 +674,11 @@ int MoofSampleTable::readSamples()
                     defaultSampleFlags = 0x00010000; // default is nonsync if first sample flags provided 
                     wordNumber++;
                 }
+                if (trackIndex >= 2)
+                    ALOGE("trackIndex %d out of range", trackIndex);
+                CHECK(trackIndex < 2);
                 for (size_t i = 0; i < sampleCount; i++) {
-                    CHECK(track_index < 2);
-                    sample.sampleIndex = ++mSampleIndex[track_index];
+                    sample.sampleIndex = ++mSampleIndex[trackIndex];
                     if (i != 0)
                         sample.sampleFlags = defaultSampleFlags;
                     if (flags & trun_sample_duration_present) {
@@ -641,27 +694,36 @@ int MoofSampleTable::readSamples()
                         wordNumber++;
                     }
                     ALOGV("track %d sample %d ticks %llx dur %lld size %d flags %x offset %lld time %lld timescale %d",
-                          track_index,
+                          trackIndex,
                           sample.sampleIndex,
                           sample.sampleDuration,
-                          (uint64_t)(sample.sampleDuration * mUsPerTick[track_index]),
+                          (uint64_t)(sample.sampleDuration * mUsPerTick[trackIndex]),
                           sample.sampleSize, sample.sampleFlags,
                           sample.sampleOffset, sample.sampleTime,
-                          mUsPerTick[track_index]);
+                          mUsPerTick[trackIndex]);
 
-                    samples[track_index].push_back(sample);
+                    ALOGV("%s:%d: locking sample lock %d", __FILE__, __LINE__, trackIndex);
+		    mSampleLock[trackIndex].lock();
+
+                    mSamples[trackIndex].push_back(sample);
+
+                    ALOGV("%s:%d: unlocking sample lock %d", __FILE__, __LINE__, trackIndex);
+		    mSampleLock[trackIndex].unlock();
+
                     sample.sampleOffset += sample.sampleSize;
-                    CHECK(mUsPerTick[track_index] != 0);
-                    sample.sampleTime += sample.sampleDuration * mUsPerTick[track_index];
+                    if (mUsPerTick[trackIndex] == 0)
+                        ALOGE("zero mUsPerTick for track %d", trackIndex);
+                    //CHECK(mUsPerTick[trackIndex] != 0);
+                    sample.sampleTime += sample.sampleDuration * mUsPerTick[trackIndex];
                 }
             } break;
             case FOURCC('t','f','d','t'): {
-                decodeTimeUs = ntohl(box[1]) * mUsPerTick[track_index];
+                decodeTimeUs = ntohl(box[1]) * mUsPerTick[trackIndex];
                 if (1)
                 ALOGV("tfdt ticks decodetime %lld (us) delta %lld (us) ", 
                       decodeTimeUs,
-                      decodeTimeUs - mLastDecodeTime[track_index]);
-                mLastDecodeTime[track_index] = decodeTimeUs;
+                      decodeTimeUs - mLastDecodeTime[trackIndex]);
+                mLastDecodeTime[trackIndex] = decodeTimeUs;
             } break;
             }
             mOffset += chunk_size;
@@ -675,18 +737,24 @@ int MoofSampleTable::readSamples()
 
 int MoofSampleTable::getSample(size_t trackIndex, size_t sampleIndex, MoofSample *sample)
 {
+    ALOGV("%s:%d: locking sample lock %d", __FILE__, __LINE__, trackIndex);
+    Mutex::Autolock autoLock(mSampleLock[trackIndex]);
+
+    if (trackIndex >= 2)
+        ALOGE("getSample trackIndex %d", trackIndex);
     CHECK(trackIndex < 2);
 
     int numTries = 0;
     do {
-        if (samples[trackIndex].size() == 0)
-            readSamples();
-        for (List<MoofSample>::iterator it = samples[trackIndex].begin();
-             it != samples[trackIndex].end(); ++it) {
+        for (List<MoofSample>::iterator it = mSamples[trackIndex].begin();
+             it != mSamples[trackIndex].end(); ++it) {
             if (it->sampleIndex == sampleIndex) {
                 *sample = *it;
-                ALOGD("got track %d sample %d buffer %d", trackIndex, sampleIndex, sample->hasBuffer());
-                samples[trackIndex].erase(it);
+                ALOGV("got track %d sample %d buffer %d", trackIndex, sampleIndex, sample->hasBuffer());
+                if (!sample->hasBuffer())
+                    break;
+                mSamples[trackIndex].erase(it);
+                ALOGV("%s:%d: unlocking sample lock %d", __FILE__, __LINE__, trackIndex);
                 return OK;
             }
             if (it->sampleIndex < sampleIndex) {
@@ -694,16 +762,33 @@ int MoofSampleTable::getSample(size_t trackIndex, size_t sampleIndex, MoofSample
                 MediaBuffer *mb = it->takeBuffer();
                 if (mb)
                     mb->release();
-                samples[trackIndex].erase(it);
+                mSamples[trackIndex].erase(it);
             }
         }
-    } while (numTries++ < 50);
+
+        ALOGV("%s:%d: unlocking sample lock %d", __FILE__, __LINE__, trackIndex);
+        mSampleLock[trackIndex].unlock();
+
+        // tell it to read more samples
+        sem_post(&mProducerSemaphore);
+
+        // and wait for the response
+        ALOGV("getSample waiting for consumer semaphore");
+        sem_wait(&mConsumerSemaphore);
+        ALOGV("getSample consumer semaphore proceeding");
+
+        ALOGV("%s:%d: locking sample lock %d", __FILE__, __LINE__, trackIndex);
+        mSampleLock[trackIndex].lock();
+
+    } while (numTries++ < 50); // totally arbitrary 50
     ALOGE("track %d sample %d out of range ", trackIndex, sampleIndex);
+    ALOGV("%s:%d: unlocking sample lock %d", __FILE__, __LINE__, trackIndex);
     return -1;    
 }
 
 int MoofSampleTable::setTimeScale(size_t trackIndex, uint32_t timeScale)
 {
+
     CHECK(trackIndex < 2);
     mUsPerTick[trackIndex] = 1.0e6 / timeScale;
     ALOGV("setTimeScale track %d timeScale %d us/tick %d",
@@ -852,6 +937,8 @@ size_t MoofExtractor::countTracks() {
         track = track->next;
     }
 
+    //FIXME
+    n = 1;
     ALOGV("countTracks %d", n);
 
     return n;
@@ -913,14 +1000,17 @@ status_t MoofExtractor::readMetaData()
         mOffset = offset;
 
     mMoofSampleTable = new MoofSampleTable(mOffset, mDataSource);
+    ALOGD("new mMoofSampleTable");
     Track *track = mFirstTrack;
-    size_t track_index = 0;
+    size_t trackIndex = 0;
     while (track) {
-        mMoofSampleTable->setTimeScale(track_index, track->timescale);
-        mMoofSampleTable->setTrackMetaData(track_index, track->meta);
-        track_index++;
+        mMoofSampleTable->setTimeScale(trackIndex, track->timescale);
+        mMoofSampleTable->setTrackMetaData(trackIndex, track->meta);
+        trackIndex++;
         track = track->next;
     }
+
+    mMoofSampleTable->onMetaDataReady();
 
     CHECK_NE(err, (status_t)NO_INIT);
     return mInitCheck;
@@ -2530,6 +2620,17 @@ status_t MoofSource::read(
 
     ALOGV("track %d sample %d offset %lld size %d time %lld err %d",
           mTrackIndex, mCurrentSampleIndex, offset, size, targetSampleTimeUs, err);
+    if (0) {
+        ALOGD("buffer size %d range_offset %d range_length %d",
+              mBuffer->size(), mBuffer->range_offset(), mBuffer->range_length());
+        if (mBuffer->range_offset() > 0
+            || (mBuffer->range_offset() + mBuffer->range_length()) > mBuffer->size())
+            ALOGE("bad buffer?");
+        char prefix[128];
+        snprintf(prefix, sizeof(prefix), "this %p track %d sample %d: ",
+                 this, mTrackIndex, mCurrentSampleIndex);
+        hexdump(prefix, mBuffer->data(), mBuffer->range_length());
+    }
 
     if (err != OK) {
         return err;
