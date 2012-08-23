@@ -15,7 +15,7 @@
  */
 
 //#define LOG_NDEBUG 0
-#define LOG_TAG "MOOFExtractor"
+#define LOG_TAG "MoofExtractor"
 #include <utils/Log.h>
 
 #include "include/MoofExtractor.h"
@@ -345,6 +345,8 @@ void *MoofSampleTable::threadWrapper(void *self)
 
 void MoofSampleTable::run()
 {
+    char skipbuf[1024];
+    mDataSource->readAt(0, skipbuf, mOffset);
     while (1) {
         ALOGV("MoofSampleTable::run() waiting for producer semaphore");
         sem_wait(&mProducerSemaphore);
@@ -517,8 +519,9 @@ int MoofSampleTable::readSamples()
     ALOGV("readSamples mOffset=%lld", mOffset);
     while (!done) {
         uint32_t hdr[2];
-        if (mDataSource->readAt(mOffset, hdr, 8) < 8) {
-            ALOGE("short read @ %lld %llx", mOffset, mOffset);
+        size_t bytesRead = 0;
+        if ((bytesRead = mDataSource->readAt(mOffset, hdr, 8)) < 8) {
+            ALOGE("short read @ %lld / %d", mOffset, bytesRead);
             return ERROR_IO;
         }
         uint64_t chunk_size = ntohl(hdr[0]);
@@ -527,6 +530,7 @@ int MoofSampleTable::readSamples()
         uint64_t chunk_data_size = chunk_size - 8;
         if (chunk_size == 1) {
             if (mDataSource->readAt(mOffset + 8, &chunk_size, 8) < 8) {
+                ALOGE("%s:%d: short read @ %lld", __FILE__, __LINE__, mOffset);
                 return ERROR_IO;
             }
             chunk_size = ntoh64(chunk_size);
@@ -604,6 +608,7 @@ int MoofSampleTable::readSamples()
         case FOURCC('t','f','d','t'): {
             uint32_t box[256];
             if (mDataSource->readAt(data_offset, box, chunk_size-8) < (chunk_size-8)) {
+                ALOGE("%s:%d readAt short read", __FILE__, __LINE__);
                 return ERROR_IO;
             }
             uint32_t flags = ntohl(box[0]);
@@ -981,7 +986,7 @@ status_t MoofExtractor::readMetaData()
     status_t err = 0;
     while ((err = parseChunk(&offset, 0)) == OK) {
     }
-    ALOGV("metadata read offset=%lld/%llx err=%d", offset, offset, err);
+    ALOGD("metadata read offset=%lld/%llx err=%d", offset, offset, err);
 
     if (mInitCheck == OK) {
         if (mHasVideo) {
@@ -993,11 +998,14 @@ status_t MoofExtractor::readMetaData()
 
         mInitCheck = OK;
     } else {
+        ALOGV("%s:%d: mInitCheck=%d", __FILE__, __LINE__, err);
         mInitCheck = err;
     }
 
     if (mInitCheck == OK)
         mOffset = offset;
+    else
+        mOffset = 0;
 
     mMoofSampleTable = new MoofSampleTable(mOffset, mDataSource);
     ALOGD("new mMoofSampleTable");
@@ -1059,6 +1067,7 @@ status_t MoofExtractor::parseDrmSINF(off64_t *offset, off64_t data_offset)
 {
     uint8_t updateIdTag;
     if (mDataSource->readAt(data_offset, &updateIdTag, 1) < 1) {
+        ALOGE("%s:%d: short read @ %lld", __FILE__, __LINE__, data_offset);
         return ERROR_IO;
     }
     data_offset ++;
@@ -1250,24 +1259,6 @@ status_t MoofExtractor::parseChunk(off64_t *offset, int depth) {
     MakeFourCCString(chunk_type, chunk);
     ALOGV("chunk: %s @ %lld", chunk, *offset);
 
-#if 0
-    static const char kWhitespace[] = "                                        ";
-    const char *indent = &kWhitespace[sizeof(kWhitespace) - 1 - 2 * depth];
-    printf("%sfound chunk '%s' of size %lld\n", indent, chunk, chunk_size);
-
-    char buffer[256];
-    size_t n = chunk_size;
-    if (n > sizeof(buffer)) {
-        n = sizeof(buffer);
-    }
-    if (mDataSource->readAt(*offset, buffer, n)
-            < (ssize_t)n) {
-        return ERROR_IO;
-    }
-
-    hexdump(buffer, n);
-#endif
-
     PathAdder autoAdder(&mPath, chunk_type);
 
     off64_t chunk_data_size = *offset + chunk_size - data_offset;
@@ -1292,7 +1283,14 @@ status_t MoofExtractor::parseChunk(off64_t *offset, int depth) {
     }
 
     switch(chunk_type) {
+        case FOURCC('f', 't', 'y', 'p'):
+        case FOURCC('f', 'r', 'e', 'e'):
+            mDataSource->setCachedRange(data_offset, chunk_size-data_offset);
+            *offset += chunk_size;
+        break;
         case FOURCC('m', 'o', 'o', 'v'):
+            mDataSource->setCachedRange(data_offset, chunk_size-data_offset);
+            // fll through
         case FOURCC('t', 'r', 'a', 'k'):
         case FOURCC('m', 'd', 'i', 'a'):
         case FOURCC('m', 'i', 'n', 'f'):
