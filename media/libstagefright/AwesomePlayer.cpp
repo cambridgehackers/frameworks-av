@@ -92,6 +92,7 @@ struct AwesomeLocalRenderer : public AwesomeRenderer {
     AwesomeLocalRenderer(
             const sp<ANativeWindow> &nativeWindow, const sp<MetaData> &meta)
         : mTarget(new SoftwareRenderer(nativeWindow, meta)) {
+        ALOGI("AwesomeLocalRenderer");
     }
 
     virtual void render(MediaBuffer *buffer) {
@@ -121,6 +122,7 @@ struct AwesomeNativeWindowRenderer : public AwesomeRenderer {
             const sp<ANativeWindow> &nativeWindow,
             int32_t rotationDegrees)
         : mNativeWindow(nativeWindow) {
+        ALOGI("AwesomeNativeRenderer rotation=%d", rotationDegrees);
         applyRotation(rotationDegrees);
     }
 
@@ -648,7 +650,7 @@ void AwesomePlayer::onVideoLagUpdate() {
     int64_t videoLateByUs = audioTimeUs - mVideoTimeUs;
 
     if (!(mFlags & VIDEO_AT_EOS) && videoLateByUs > 300000ll) {
-        ALOGV("video late by %lld ms.", videoLateByUs / 1000ll);
+        ALOGI("video late by %lld ms.", videoLateByUs / 1000ll);
 
         notifyListener_l(
                 MEDIA_INFO,
@@ -2008,7 +2010,10 @@ status_t AwesomePlayer::finishSetDataSource_l() {
             return err;
         }
 
-        if (!isWidevineStreaming) {
+        if (true) {
+            ALOGV("%s:%d: using a non-caching http source", __FILE__, __LINE__);
+            dataSource = mConnectingDataSource;
+        } else if (!isWidevineStreaming) {
             // The widevine extractor does its own caching.
 
 #if 0
