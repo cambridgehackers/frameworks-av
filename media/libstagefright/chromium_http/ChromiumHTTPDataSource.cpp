@@ -164,6 +164,8 @@ status_t ChromiumHTTPDataSource::initCheck() const {
 ssize_t ChromiumHTTPDataSource::readAt(off64_t offset, void *data, size_t size) {
     Mutex::Autolock autoLock(mLock);
 
+    ALOGV("readAt offset %lld size %d current offset %lld connected %d", offset, size, mCurrentOffset,
+        mState == CONNECTED);
     if (mState != CONNECTED) {
         return INVALID_OPERATION;
     }
@@ -178,7 +180,7 @@ ssize_t ChromiumHTTPDataSource::readAt(off64_t offset, void *data, size_t size) 
     }
 #endif
 
-    if (offset != mCurrentOffset) {
+    if (offset < mCurrentOffset) {
         AString tmp = mURI;
         KeyedVector<String8, String8> tmpHeaders = mHeaders;
 
@@ -190,6 +192,39 @@ ssize_t ChromiumHTTPDataSource::readAt(off64_t offset, void *data, size_t size) 
             return err;
         }
     }
+    while (offset > mCurrentOffset) {
+        size_t skip = offset - mCurrentOffset;
+        char skipbuf[4096];
+        if (skip > sizeof(skipbuf))
+            skip = sizeof(skipbuf);
+        ALOGV("readAt skipping %d bytes at offset %lld", skip, mCurrentOffset);
+        mState = READING;
+
+        int64_t startTimeUs = ALooper::GetNowUs();
+
+        mDelegate->initiateRead(skipbuf, skip);
+
+        while (mState == READING) {
+            mCondition.wait(mLock);
+        }
+
+        if (mIOResult < OK) {
+            return mIOResult;
+        }
+
+        if (mState == CONNECTED) {
+            int64_t delayUs = ALooper::GetNowUs() - startTimeUs;
+
+            // The read operation was successful, mIOResult contains
+            // the number of bytes read.
+            addBandwidthMeasurement(mIOResult, delayUs);
+
+            mCurrentOffset += mIOResult;
+        }
+        if (mIOResult == 0)
+            return mIOResult;
+    }
+    CHECK(offset == mCurrentOffset);
 
     mState = READING;
 
