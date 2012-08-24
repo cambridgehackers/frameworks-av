@@ -70,6 +70,10 @@ bool MetaData::setFloat(uint32_t key, float value) {
     return setData(key, TYPE_FLOAT, &value, sizeof(value));
 }
 
+bool MetaData::setDouble(uint32_t key, double value) {
+    return setData(key, TYPE_DOUBLE, &value, sizeof(value));
+}
+
 bool MetaData::setPointer(uint32_t key, void *value) {
     return setData(key, TYPE_POINTER, &value, sizeof(value));
 }
@@ -141,6 +145,21 @@ bool MetaData::findFloat(uint32_t key, float *value) {
     CHECK_EQ(size, sizeof(*value));
 
     *value = *(float *)data;
+
+    return true;
+}
+
+bool MetaData::findDouble(uint32_t key, double *value) {
+    uint32_t type;
+    const void *data;
+    size_t size;
+    if (!findData(key, &type, &data, &size) || type != TYPE_DOUBLE) {
+        return false;
+    }
+
+    CHECK_EQ(size, sizeof(*value));
+
+    *value = *(double *)data;
 
     return true;
 }

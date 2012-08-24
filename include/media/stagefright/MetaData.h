@@ -173,6 +173,7 @@ public:
         TYPE_INT32    = 'in32',
         TYPE_INT64    = 'in64',
         TYPE_FLOAT    = 'floa',
+        TYPE_DOUBLE   = 'dbl ',
         TYPE_POINTER  = 'ptr ',
         TYPE_RECT     = 'rect',
     };
@@ -184,6 +185,7 @@ public:
     bool setInt32(uint32_t key, int32_t value);
     bool setInt64(uint32_t key, int64_t value);
     bool setFloat(uint32_t key, float value);
+    bool setDouble(uint32_t key, double value);
     bool setPointer(uint32_t key, void *value);
 
     bool setRect(
@@ -195,6 +197,7 @@ public:
     bool findInt32(uint32_t key, int32_t *value);
     bool findInt64(uint32_t key, int64_t *value);
     bool findFloat(uint32_t key, float *value);
+    bool findDouble(uint32_t key, double *value);
     bool findPointer(uint32_t key, void **value);
 
     bool findRect(
