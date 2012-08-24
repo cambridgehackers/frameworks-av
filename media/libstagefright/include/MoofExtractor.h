@@ -63,6 +63,7 @@ private:
     sp<MoofSampleTable> mMoofSampleTable;
     status_t mInitCheck;
     bool mHasVideo;
+    double mStartupTimeStamp;
 
     int mNumTracks;
     Track *mFirstTrack, *mLastTrack;

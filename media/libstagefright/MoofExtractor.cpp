@@ -252,12 +252,13 @@ struct MoofSample {
     uint64_t sampleTime;     // microseconds
     uint32_t sampleFlags;
     uint32_t cts;
+    double   mfts;
     sp<MetaData> meta;
 private:
     MediaBuffer *buffer;
 };
 
-class MoofSampleTable : public RefBase {
+class MoofSampleTable : public RefBase, MediaBufferObserver {
 public:
     MoofSampleTable(uint64_t offset, sp<MoofDataSource> &dataSource);
     ~MoofSampleTable();
@@ -265,7 +266,13 @@ public:
     int setTimeScale(size_t trackIndex, uint32_t timeScale);
     void setTrackMetaData(size_t trackIndex, sp<MetaData> &meta) { mMetaData[trackIndex] = meta; }
     void onMetaDataReady();
+
+    // MediaBufferObserver
+    virtual void signalBufferReturned(MediaBuffer *buffer);
 private:
+    enum {
+        kMfts = 'mfts'
+    };
     status_t acquireBuffer(MediaBuffer **buffer, int track, uint64_t size);
     status_t readSample(const sp<MetaData> &format, MoofSample *sample, MediaBuffer *buffer);
     int readSamples();
@@ -279,6 +286,8 @@ private:
     sem_t mProducerSemaphore;
     sem_t mConsumerSemaphore;
     bool  mDone;
+    double mSampleTableTimeStamp;
+    double mFirstMfts;
 
     List<MoofSample> mSamples[2];
     size_t mTrackIndexes[2];
@@ -317,6 +326,10 @@ MoofSampleTable::MoofSampleTable(uint64_t offset, sp<MoofDataSource> &dataSource
             mGroup[i]->add_buffer(buffer);
         }
     }
+    struct timeval tv;
+    struct timezone tz;
+    gettimeofday(&tv, &tz);
+    mSampleTableTimeStamp = tv.tv_sec + tv.tv_usec / 1.0e6;
 }
 
 MoofSampleTable::~MoofSampleTable()
@@ -334,6 +347,21 @@ MoofSampleTable::~MoofSampleTable()
 void MoofSampleTable::onMetaDataReady()
 {
     sem_post(&mProducerSemaphore);
+}
+
+void MoofSampleTable::signalBufferReturned(MediaBuffer *buffer)
+{
+    struct timeval tv;
+    struct timezone tz;
+    gettimeofday(&tv, &tz);
+    double bufferMfts = 0;
+    buffer->meta_data()->findDouble(kMfts, &bufferMfts);
+    ALOGD("buffer mfts %.3f returned after %.3f seconds ",
+          bufferMfts, (tv.tv_sec + tv.tv_usec / 1.0e6) - bufferMfts);
+
+    //FIXME: should reuse the buffer
+    buffer->setObserver(NULL);
+    buffer->release();
 }
 
 void *MoofSampleTable::threadWrapper(void *self)
@@ -358,7 +386,9 @@ void MoofSampleTable::run()
 
 int MoofSampleTable::acquireBuffer(MediaBuffer **pbuffer, int track, uint64_t size)
 {
-    MediaBuffer *buffer = new MediaBuffer(size);;
+    MediaBuffer *buffer = new MediaBuffer(size);
+    buffer->add_ref();
+    buffer->setObserver(this);
     ALOGV("buffer %p size() %d size %lld sample lock %d", buffer, buffer->size(), size, track);
     CHECK(buffer != NULL);
     CHECK(buffer->size() >= size);
@@ -404,6 +434,7 @@ status_t MoofSampleTable::readSample(const sp<MetaData> &format,
         buffer->set_range(0, size);
         buffer->meta_data()->clear();
         buffer->meta_data()->setInt64(kKeyTime, sample->sampleTime);
+        buffer->meta_data()->setDouble(kMfts, sample->mfts);
 
         uint64_t targetSampleTimeUs = sample->sampleTime;
         buffer->meta_data()->setInt64(
@@ -487,6 +518,7 @@ status_t MoofSampleTable::readSample(const sp<MetaData> &format,
 
         buffer->meta_data()->clear();
         buffer->meta_data()->setInt64(kKeyTime, sample->sampleTime);
+        buffer->meta_data()->setDouble(kMfts, sample->mfts);
 
         // FIXME
         int64_t targetSampleTimeUs = sample->sampleTime;
@@ -512,9 +544,10 @@ int MoofSampleTable::readSamples()
     uint32_t defaultSampleDuration = 0;
     uint32_t defaultSampleSize = 0;
     uint32_t defaultSampleFlags = 0;
-    uint64_t decodeTimeUs = 0;
+    uint64_t decodeTimeUs;
 
     uint64_t sampleDataOffset = 0;
+    double mfts_source_time = 0;
 
     ALOGV("readSamples mOffset=%lld", mOffset);
     while (!done) {
@@ -599,10 +632,23 @@ int MoofSampleTable::readSamples()
                 ALOGE("read %d samples at offset %lld", numSamplesRead, data_offset);
             return OK;
         } break;
-        case FOURCC('m','f','t','s'):
-            // skip this chunk
+        case FOURCC('m','f','t','s'): {
+            uint32_t box[2];
+            if (mDataSource->readAt(data_offset, box, chunk_size-8) < (chunk_size-8)) {
+                ALOGE("%s:%d readAt short read", __FILE__, __LINE__);
+                return ERROR_IO;
+            }
+            struct timeval tv;
+            struct timezone tz;
+            gettimeofday(&tv, &tz);
+            box[0] = ntohl(box[0]);
+            box[1] = ntohl(box[1]);
+            mfts_source_time = box[0] + box[1] / 1.0e6;
+            double local_time = tv.tv_sec + tv.tv_usec / 1.0e6;
+            ALOGD("mfts delta %.3g source %x.%x local %lx.%lx",
+                  local_time - mfts_source_time, box[0], box[1], tv.tv_sec, tv.tv_usec);
             mOffset += chunk_size;
-            break;
+        } break;
         case FOURCC('t','f','h','d'):
         case FOURCC('t','r','u','n'):
         case FOURCC('t','f','d','t'): {
@@ -618,6 +664,7 @@ int MoofSampleTable::readSamples()
                 if (trackIndex >= 2)
                     ALOGE("trackIndex %d out of range", trackIndex);
                 CHECK(trackIndex < 2);
+                decodeTimeUs = mLastDecodeTime[trackIndex];
                 enum tfhd_flags {
                     tfhd_default                         = 0x000000,
                     tfhd_base_data_offset_present        = 0x000001,
@@ -665,6 +712,7 @@ int MoofSampleTable::readSamples()
                 int wordNumber = 2; // first word of trun sample info
                 MoofSample sample;
                 sample.sampleTime = decodeTimeUs;
+                sample.mfts = mfts_source_time;
                 sample.sampleDuration = defaultSampleDuration;
                 sample.sampleSize = defaultSampleSize;
                 sample.sampleOffset = sampleDataOffset;
@@ -720,12 +768,13 @@ int MoofSampleTable::readSamples()
                         ALOGE("zero mUsPerTick for track %d", trackIndex);
                     //CHECK(mUsPerTick[trackIndex] != 0);
                     sample.sampleTime += sample.sampleDuration * mUsPerTick[trackIndex];
+                    mLastDecodeTime[trackIndex] = sample.sampleTime;
                 }
             } break;
             case FOURCC('t','f','d','t'): {
                 decodeTimeUs = ntohl(box[1]) * mUsPerTick[trackIndex];
                 if (1)
-                ALOGV("tfdt ticks decodetime %lld (us) delta %lld (us) ", 
+                ALOGD("tfdt ticks decodetime %lld (us) delta %lld (us) ", 
                       decodeTimeUs,
                       decodeTimeUs - mLastDecodeTime[trackIndex]);
                 mLastDecodeTime[trackIndex] = decodeTimeUs;
@@ -892,6 +941,10 @@ MoofExtractor::MoofExtractor(const sp<DataSource> &source)
       mFirstSINF(NULL),
       mIsDrm(false) {
     ALOGV("MoofExtractor");
+    struct timeval tv;
+    struct timezone tz;
+    gettimeofday(&tv, &tz);
+    mStartupTimeStamp = tv.tv_sec + tv.tv_usec / 1.0e6;    
 }
 
 MoofExtractor::~MoofExtractor() {
@@ -2616,8 +2669,14 @@ status_t MoofSource::read(
 
     mBuffer = sample.takeBuffer();
 
-    ALOGV("track %d sample %d offset %lld size %d time %lld err %d",
-          mTrackIndex, mCurrentSampleIndex, offset, size, targetSampleTimeUs, err);
+    if (0) {
+        struct timeval tv;
+        struct timezone tz;
+        gettimeofday(&tv, &tz);
+        ALOGV("track %d sample %d delay %.3f offset %lld size %d time %lld err %d",
+              mTrackIndex, mCurrentSampleIndex, (tv.tv_sec + tv.tv_usec / 1.0e6) - sample.mfts,
+              offset, size, targetSampleTimeUs, err);
+    }
     if (0) {
         ALOGD("buffer size %d range_offset %d range_length %d",
               mBuffer->size(), mBuffer->range_offset(), mBuffer->range_length());
