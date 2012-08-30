@@ -33,6 +33,7 @@
 #include <media/stagefright/CameraSourceTimeLapse.h>
 #include <media/stagefright/MPEG2TSWriter.h>
 #include <media/stagefright/MPEG4Writer.h>
+#include <media/stagefright/MoofWriter.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/OMXClient.h>
@@ -1476,7 +1477,12 @@ status_t StagefrightRecorder::setupMPEG4Recording(
     mediaWriter->clear();
     *totalBitRate = 0;
     status_t err = OK;
-    sp<MediaWriter> writer = new MPEG4Writer(outputFd);
+    sp<MediaWriter> writer;
+    ALOGD("mOutputFormat %d", mOutputFormat);
+    if (mOutputFormat == OUTPUT_FORMAT_MPEG_4)
+      writer = new MoofWriter(outputFd);
+    else
+      writer = new MPEG4Writer(outputFd);
 
     if (mVideoSource < VIDEO_SOURCE_LIST_END) {
 

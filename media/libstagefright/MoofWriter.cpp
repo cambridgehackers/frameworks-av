@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-//#define LOG_NDEBUG 0
-#define LOG_TAG "MPEG4Writer"
+#define LOG_NDEBUG 0
+#define LOG_TAG "MoofWriter"
 #include <utils/Log.h>
 
 #include <arpa/inet.h>
@@ -24,7 +24,7 @@
 #include <sys/prctl.h>
 
 #include <media/stagefright/foundation/ADebug.h>
-#include <media/stagefright/MPEG4Writer.h>
+#include <media/stagefright/MoofWriter.h>
 #include <media/stagefright/MediaBuffer.h>
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/MediaDefs.h>
@@ -35,6 +35,7 @@
 #include <cutils/properties.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -47,9 +48,9 @@ static const uint8_t kNalUnitTypeSeqParamSet = 0x07;
 static const uint8_t kNalUnitTypePicParamSet = 0x08;
 static const int64_t kInitialDelayTimeUs     = 700000LL;
 
-class MPEG4Writer::Track {
+class MoofWriter::Track {
 public:
-    Track(MPEG4Writer *owner, const sp<MediaSource> &source, size_t trackId);
+    Track(MoofWriter *owner, const sp<MediaSource> &source, size_t trackId);
 
     ~Track();
 
@@ -61,12 +62,13 @@ public:
     int64_t getDurationUs() const;
     int64_t getEstimatedTrackSizeBytes() const;
     void writeTrackHeader(bool use32BitOffset = true);
-    void bufferChunk(int64_t timestampUs);
+    void bufferChunk(int64_t timestampUs, int32_t durationUs, MediaBuffer *samples);
     bool isAvc() const { return mIsAvc; }
     bool isAudio() const { return mIsAudio; }
     bool isMPEG4() const { return mIsMPEG4; }
     void addChunkOffset(off64_t offset);
     int32_t getTrackId() const { return mTrackId; }
+    int32_t getTimeScale() const { return mTimeScale; }
     status_t dump(int fd, const Vector<String16>& args) const;
 
 private:
@@ -75,7 +77,7 @@ private:
         kSampleArraySize = 1000,
     };
 
-    MPEG4Writer *mOwner;
+    MoofWriter *mOwner;
     sp<MetaData> mMeta;
     sp<MediaSource> mSource;
     volatile bool mDone;
@@ -109,48 +111,8 @@ private:
     List<uint32_t *>    mSampleSizes;
     bool                mSamplesHaveSameSize;
 
-    List<MediaBuffer *> mChunkSamples;
-
     size_t              mNumStcoTableEntries;
-    List<off64_t>         mChunkOffsets;
 
-    size_t              mNumStscTableEntries;
-    struct StscTableEntry {
-
-        StscTableEntry(uint32_t chunk, uint32_t samples, uint32_t id)
-            : firstChunk(chunk),
-              samplesPerChunk(samples),
-              sampleDescriptionId(id) {}
-
-        uint32_t firstChunk;
-        uint32_t samplesPerChunk;
-        uint32_t sampleDescriptionId;
-    };
-    List<StscTableEntry> mStscTableEntries;
-
-    size_t        mNumStssTableEntries;
-    List<int32_t> mStssTableEntries;
-
-    struct SttsTableEntry {
-
-        SttsTableEntry(uint32_t count, uint32_t duration)
-            : sampleCount(count), sampleDuration(duration) {}
-
-        uint32_t sampleCount;
-        uint32_t sampleDuration;  // time scale based
-    };
-    size_t        mNumSttsTableEntries;
-    List<SttsTableEntry> mSttsTableEntries;
-
-    struct CttsTableEntry {
-        CttsTableEntry(uint32_t count, int32_t timescaledDur)
-            : sampleCount(count), sampleDuration(timescaledDur) {}
-
-        uint32_t sampleCount;
-        uint32_t sampleDuration;  // time scale based
-    };
-    size_t        mNumCttsTableEntries;
-    List<CttsTableEntry> mCttsTableEntries;
     int64_t mMinCttsOffsetTimeUs;
     int64_t mMaxCttsOffsetTimeUs;
 
@@ -212,12 +174,6 @@ private:
     int32_t mRotation;
 
     void updateTrackSizeEstimate();
-    void addOneStscTableEntry(size_t chunkId, size_t sampleId);
-    void addOneStssTableEntry(size_t sampleId);
-
-    // Duration is time scale based
-    void addOneSttsTableEntry(size_t sampleCount, int32_t timescaledDur);
-    void addOneCttsTableEntry(size_t sampleCount, int32_t timescaledDur);
 
     bool isTrackMalFormed() const;
     void sendTrackSummary(bool hasMultipleTracks);
@@ -228,7 +184,6 @@ private:
     void writeStszBox();
     void writeStssBox();
     void writeSttsBox();
-    void writeCttsBox();
     void writeD263Box();
     void writePaspBox();
     void writeAvccBox();
@@ -251,7 +206,7 @@ private:
     Track &operator=(const Track &);
 };
 
-MPEG4Writer::MPEG4Writer(const char *filename)
+MoofWriter::MoofWriter(const char *filename)
     : mFd(-1),
       mInitCheck(NO_INIT),
       mUse4ByteNalLength(true),
@@ -261,13 +216,15 @@ MPEG4Writer::MPEG4Writer(const char *filename)
       mStarted(false),
       mWriterThreadStarted(false),
       mOffset(0),
-      mMdatOffset(0),
+      mFileType(0),
       mEstimatedMoovBoxSize(0),
-      mInterleaveDurationUs(1000000),
+      mInterleaveDurationUs(0), //(1000000),
       mLatitudex10000(0),
       mLongitudex10000(0),
       mAreGeoTagsAvailable(false),
-      mStartTimeOffsetMs(-1) {
+      mStartTimeOffsetMs(-1),
+      mGotAllCodecSpecificData(0),
+      mSequenceNumber(1) {
 
     mFd = open(filename, O_CREAT | O_LARGEFILE | O_TRUNC | O_RDWR);
     if (mFd >= 0) {
@@ -275,7 +232,7 @@ MPEG4Writer::MPEG4Writer(const char *filename)
     }
 }
 
-MPEG4Writer::MPEG4Writer(int fd)
+MoofWriter::MoofWriter(int fd)
     : mFd(dup(fd)),
       mInitCheck(mFd < 0? NO_INIT: OK),
       mUse4ByteNalLength(true),
@@ -285,16 +242,19 @@ MPEG4Writer::MPEG4Writer(int fd)
       mStarted(false),
       mWriterThreadStarted(false),
       mOffset(0),
-      mMdatOffset(0),
+      mFileType(0),
       mEstimatedMoovBoxSize(0),
       mInterleaveDurationUs(1000000),
       mLatitudex10000(0),
       mLongitudex10000(0),
       mAreGeoTagsAvailable(false),
-      mStartTimeOffsetMs(-1) {
+      mStartTimeOffsetMs(-1),
+      mGotAllCodecSpecificData(0),
+      mSequenceNumber(1) {
+    ALOGV("MoofWriter::MoofWriter");
 }
 
-MPEG4Writer::~MPEG4Writer() {
+MoofWriter::~MoofWriter() {
     reset();
 
     while (!mTracks.empty()) {
@@ -306,12 +266,12 @@ MPEG4Writer::~MPEG4Writer() {
     mTracks.clear();
 }
 
-status_t MPEG4Writer::dump(
+status_t MoofWriter::dump(
         int fd, const Vector<String16>& args) {
     const size_t SIZE = 256;
     char buffer[SIZE];
     String8 result;
-    snprintf(buffer, SIZE, "   MPEG4Writer %p\n", this);
+    snprintf(buffer, SIZE, "   MoofWriter %p\n", this);
     result.append(buffer);
     snprintf(buffer, SIZE, "     mStarted: %s\n", mStarted? "true": "false");
     result.append(buffer);
@@ -323,7 +283,7 @@ status_t MPEG4Writer::dump(
     return OK;
 }
 
-status_t MPEG4Writer::Track::dump(
+status_t MoofWriter::Track::dump(
         int fd, const Vector<String16>& args) const {
     const size_t SIZE = 256;
     char buffer[SIZE];
@@ -337,7 +297,7 @@ status_t MPEG4Writer::Track::dump(
     return OK;
 }
 
-status_t MPEG4Writer::addSource(const sp<MediaSource> &source) {
+status_t MoofWriter::addSource(const sp<MediaSource> &source) {
     Mutex::Autolock l(mLock);
     if (mStarted) {
         ALOGE("Attempt to add source AFTER recording is started");
@@ -349,7 +309,7 @@ status_t MPEG4Writer::addSource(const sp<MediaSource> &source) {
     return OK;
 }
 
-status_t MPEG4Writer::startTracks(MetaData *params) {
+status_t MoofWriter::startTracks(MetaData *params) {
     for (List<Track *>::iterator it = mTracks.begin();
          it != mTracks.end(); ++it) {
         status_t err = (*it)->start(params);
@@ -366,7 +326,7 @@ status_t MPEG4Writer::startTracks(MetaData *params) {
     return OK;
 }
 
-int64_t MPEG4Writer::estimateMoovBoxSize(int32_t bitRate) {
+int64_t MoofWriter::estimateMoovBoxSize(int32_t bitRate) {
     // This implementation is highly experimental/heurisitic.
     //
     // Statistical analysis shows that metadata usually accounts
@@ -425,11 +385,19 @@ int64_t MPEG4Writer::estimateMoovBoxSize(int32_t bitRate) {
     return factor * size;
 }
 
-status_t MPEG4Writer::start(MetaData *param) {
+int64_t MoofWriter::estimateMoofBoxSize() {
+
+    // let's just try a fixed size, empirically determined
+
+    return 512;
+}
+
+status_t MoofWriter::start(MetaData *param) {
     if (mInitCheck != OK) {
         return UNKNOWN_ERROR;
     }
 
+    ALOGV("start");
     /*
      * Check mMaxFileSizeLimitBytes at the beginning
      * since mMaxFileSizeLimitBytes may be implicitly
@@ -446,6 +414,9 @@ status_t MPEG4Writer::start(MetaData *param) {
         use64BitOffset) {
         mUse32BitOffset = false;
     }
+
+    if (param)
+        param->findInt32(kKeyFileType, &mFileType);
 
     if (mUse32BitOffset) {
         // Implicit 32 bit file size limit
@@ -485,37 +456,11 @@ status_t MPEG4Writer::start(MetaData *param) {
         mTimeScale = 1000;
     }
     CHECK_GT(mTimeScale, 0);
-    ALOGV("movie time scale: %d", mTimeScale);
+    ALOGD("movie time scale: %d", mTimeScale);
 
-    mStreamableFile = true;
     mWriteMoovBoxToMemory = false;
     mMoovBoxBuffer = NULL;
     mMoovBoxBufferOffset = 0;
-
-    writeFtypBox(param);
-
-    mFreeBoxOffset = mOffset;
-
-    if (mEstimatedMoovBoxSize == 0) {
-        int32_t bitRate = -1;
-        if (param) {
-            param->findInt32(kKeyBitRate, &bitRate);
-        }
-        mEstimatedMoovBoxSize = estimateMoovBoxSize(bitRate);
-    }
-    CHECK_GE(mEstimatedMoovBoxSize, 8);
-    lseek64(mFd, mFreeBoxOffset, SEEK_SET);
-    writeInt32(mEstimatedMoovBoxSize);
-    write("free", 4);
-
-    mMdatOffset = mFreeBoxOffset + mEstimatedMoovBoxSize;
-    mOffset = mMdatOffset;
-    lseek64(mFd, mMdatOffset, SEEK_SET);
-    if (mUse32BitOffset) {
-        write("????mdat", 8);
-    } else {
-        write("\x00\x00\x00\x01mdat????????", 16);
-    }
 
     status_t err = startWriterThread();
     if (err != OK) {
@@ -531,11 +476,11 @@ status_t MPEG4Writer::start(MetaData *param) {
     return OK;
 }
 
-bool MPEG4Writer::use32BitFileOffset() const {
+bool MoofWriter::use32BitFileOffset() const {
     return mUse32BitOffset;
 }
 
-status_t MPEG4Writer::pause() {
+status_t MoofWriter::pause() {
     if (mInitCheck != OK) {
         return OK;
     }
@@ -551,7 +496,7 @@ status_t MPEG4Writer::pause() {
     return err;
 }
 
-void MPEG4Writer::stopWriterThread() {
+void MoofWriter::stopWriterThread() {
     ALOGD("Stopping writer thread");
     if (!mWriterThreadStarted) {
         return;
@@ -568,6 +513,8 @@ void MPEG4Writer::stopWriterThread() {
     pthread_join(mThread, &dummy);
     mWriterThreadStarted = false;
     ALOGD("Writer thread stopped");
+    int status = ::close(mFd);
+    ALOGD("Writer fd closed staus=%d errno=%d", status, errno);
 }
 
 /*
@@ -581,7 +528,7 @@ void MPEG4Writer::stopWriterThread() {
  * where a, b, c, d, x, and y is in 16.16 format, while
  * u, v and w is in 2.30 format.
  */
-void MPEG4Writer::writeCompositionMatrix(int degrees) {
+void MoofWriter::writeCompositionMatrix(int degrees) {
     ALOGV("writeCompositionMatrix");
     uint32_t a = 0x00010000;
     uint32_t b = 0;
@@ -622,14 +569,18 @@ void MPEG4Writer::writeCompositionMatrix(int degrees) {
     writeInt32(0x40000000);  // w
 }
 
-void MPEG4Writer::release() {
-    close(mFd);
+void MoofWriter::release() {
+    ALOGD("MoofWriter::release()");
+    if (mFd > 0)
+        close(mFd);
     mFd = -1;
     mInitCheck = NO_INIT;
     mStarted = false;
 }
 
-status_t MPEG4Writer::reset() {
+status_t MoofWriter::reset() {
+    ALOGV("MoofWriter::reset() mInitCheck=%d mStarted=%d mWriterThreadStarted=%d",
+          mInitCheck, mStarted, mWriterThreadStarted);
     if (mInitCheck != OK) {
         return OK;
     } else {
@@ -675,55 +626,13 @@ status_t MPEG4Writer::reset() {
         return err;
     }
 
-    // Fix up the size of the 'mdat' chunk.
-    if (mUse32BitOffset) {
-        lseek64(mFd, mMdatOffset, SEEK_SET);
-        int32_t size = htonl(static_cast<int32_t>(mOffset - mMdatOffset));
-        ::write(mFd, &size, 4);
-    } else {
-        lseek64(mFd, mMdatOffset + 8, SEEK_SET);
-        int64_t size = mOffset - mMdatOffset;
-        size = hton64(size);
-        ::write(mFd, &size, 8);
-    }
-    lseek64(mFd, mOffset, SEEK_SET);
-
-    const off64_t moovOffset = mOffset;
-    mWriteMoovBoxToMemory = true;
-    mMoovBoxBuffer = (uint8_t *) malloc(mEstimatedMoovBoxSize);
-    mMoovBoxBufferOffset = 0;
-    CHECK(mMoovBoxBuffer != NULL);
-    writeMoovBox(maxDurationUs);
-
-    mWriteMoovBoxToMemory = false;
-    if (mStreamableFile) {
-        CHECK_LE(mMoovBoxBufferOffset + 8, mEstimatedMoovBoxSize);
-
-        // Moov box
-        lseek64(mFd, mFreeBoxOffset, SEEK_SET);
-        mOffset = mFreeBoxOffset;
-        write(mMoovBoxBuffer, 1, mMoovBoxBufferOffset);
-
-        // Free box
-        lseek64(mFd, mOffset, SEEK_SET);
-        writeInt32(mEstimatedMoovBoxSize - mMoovBoxBufferOffset);
-        write("free", 4);
-
-        // Free temp memory
-        free(mMoovBoxBuffer);
-        mMoovBoxBuffer = NULL;
-        mMoovBoxBufferOffset = 0;
-    } else {
-        ALOGI("The mp4 file will not be streamable.");
-    }
-
     CHECK(mBoxes.empty());
 
     release();
     return err;
 }
 
-void MPEG4Writer::writeMvhdBox(int64_t durationUs) {
+void MoofWriter::writeMvhdBox(int64_t durationUs) {
     time_t now = time(NULL);
     beginBox("mvhd");
     writeInt32(0);             // version=0, flags=0
@@ -748,26 +657,138 @@ void MPEG4Writer::writeMvhdBox(int64_t durationUs) {
     endBox();  // mvhd
 }
 
-void MPEG4Writer::writeMoovBox(int64_t durationUs) {
+void MoofWriter::writeMvexBox() {
+    beginBox("mvex");
+    for (List<Track *>::iterator it = mTracks.begin();
+        it != mTracks.end(); ++it) {
+        beginBox("trex");
+        writeInt32(0); // version, flags
+        writeInt32((*it)->getTrackId()+1);
+        writeInt32(1); // sample description index
+        writeInt32(0); // sample duration
+        writeInt32(0); // sample size
+        writeInt32(0); // sample flags
+        endBox();
+    }
+    endBox();
+}
+
+void MoofWriter::writeMoovBox(int64_t durationUs) {
+    ALOGD("writeMoovBox: %lld", durationUs);
     beginBox("moov");
+    beginBox("uri ");
+    int32_t r = rand();
+    writeInt32(r);
+    endBox();
     writeMvhdBox(durationUs);
+    writeMvexBox();
     if (mAreGeoTagsAvailable) {
         writeUdtaBox();
     }
     int32_t id = 1;
     for (List<Track *>::iterator it = mTracks.begin();
         it != mTracks.end(); ++it, ++id) {
+        ALOGD("writeMoovBox: writing track %d header\n", id);
         (*it)->writeTrackHeader(mUse32BitOffset);
     }
+    ALOGD("writeMoovBox: endBox\n");
     endBox();  // moov
 }
 
-void MPEG4Writer::writeFtypBox(MetaData *param) {
+void MoofWriter::writeMfhdBox(int64_t durationUs) {
+    time_t now = time(NULL);
+    beginBox("mfhd");
+    writeInt32(0);             // version=0, flags=0
+    writeInt32(mSequenceNumber++);           // sequence number
+    endBox();  // mfhd
+}
+
+void MoofWriter::writeMoofBox(int64_t durationUs, Chunk &chunk) {
+    //ALOGD("writeMoofBox: %lld", durationUs);
+    struct timeval tv;
+    struct timezone tz;
+    gettimeofday(&tv, &tz);
+    beginBox("moof");
+    beginBox("mfts");
+    writeInt32(tv.tv_sec);
+    writeInt32(tv.tv_usec);
+    endBox();
+    writeMfhdBox(durationUs);
+    for (Vector<ChunkInfo>::iterator it = mChunkInfos.begin();
+         it != mChunkInfos.end(); 
+         ++it) {
+        if (chunk.mTrack == it->mTrack) 
+            writeTrackFragmentHeader(*it, mUse32BitOffset);
+    }
+    endBox();  // moof
+}
+
+void MoofWriter::writeTrackFragmentHeader(ChunkInfo &chunkInfo, bool use32BitOffset) {
+    int32_t sampleCount = chunkInfo.mSampleCount;
+    chunkInfo.mSampleCount = 0;
+
+    beginBox("traf"); {
+        beginBox("tfhd"); {
+            enum tfhd_flags {
+                tfhd_default                         = 0x000000,
+                tfhd_base_data_offset_present        = 0x000001,
+                tfhd_default_sample_duration_present = 0x000008,
+                tfhd_default_sample_size_present     = 0x000010,
+                tfhd_default_sample_flags_present    = 0x000020,
+            };
+            int flags = tfhd_base_data_offset_present;
+            int32_t trackId = chunkInfo.mTrack->getTrackId();
+            //flags |= tfhd_default_sample_duration_present;
+            //flags |= tfhd_default_sample_size_present;
+            writeInt32(0 | flags); // 8 bit version and tf flags
+            writeInt32(trackId+1);
+
+            // optional fields
+            mDataOffsetOffset = mMoovBoxBufferOffset;
+            writeInt64(0); // fix up with data offset later
+            //writeInt32(chunkInfo.mSampleDurationTicks);
+            //writeInt32(chunkInfo.mSampleSize);
+        } endBox();
+        beginBox("trun"); {
+            enum trun_flags {
+                trun_default                    = 0x000000,
+                trun_data_offset_present        = 0x000001,
+                trun_first_sample_flags_present = 0x000004,
+                trun_sample_duration_present    = 0x000100,
+                trun_sample_size_present        = 0x000200,
+                trun_sample_flags_present       = 0x000400,
+                trun_sample_composition_time_present = 0x000800,
+            };
+            int flags = trun_sample_duration_present | trun_sample_size_present;
+
+            writeInt32(0 | flags); // version 0
+            writeInt32(sampleCount); // sample count
+            //writeInt32(*chunkInfo.mChunkOffsets.begin()); // data offset
+            //writeInt32(0); // first sample flags
+
+            // one per sample, for only one sample
+              writeInt32(chunkInfo.mSampleDurationTicks);
+              writeInt32(chunkInfo.mSampleSize);
+
+              //writeInt32(chunkInfo.mChunkFlags); // sample flags
+              //writeInt32(chunkInfo.mChunkSampleCompositionTimes); // sample composition time (64bit for version != 0)
+
+        } endBox();
+#if 0
+        beginBox("tfdt"); {
+            writeInt32(1); // version 1
+            writeInt32(chunkInfo.mBaseMediaDecodeTimeUs); // base media decode time
+            //writeInt32(0); // data offset
+        } endBox();
+#endif
+    } endBox();
+}
+
+void MoofWriter::writeFtypBox() {
     beginBox("ftyp");
 
     int32_t fileType;
-    if (param && param->findInt32(kKeyFileType, &fileType) &&
-        fileType != OUTPUT_FORMAT_MPEG_4) {
+    if (mFileType != OUTPUT_FORMAT_MPEG_4) {
         writeFourcc("3gp4");
     } else {
         writeFourcc("isom");
@@ -776,6 +797,7 @@ void MPEG4Writer::writeFtypBox(MetaData *param) {
     writeInt32(0);
     writeFourcc("isom");
     writeFourcc("3gp4");
+    writeFourcc("dash");
     endBox();
 }
 
@@ -794,13 +816,13 @@ static bool isTestModeEnabled() {
     return false;
 }
 
-void MPEG4Writer::sendSessionSummary() {
+void MoofWriter::sendSessionSummary() {
     // Send session summary only if test mode is enabled
     if (!isTestModeEnabled()) {
         return;
     }
 
-    for (List<ChunkInfo>::iterator it = mChunkInfos.begin();
+    for (Vector<ChunkInfo>::iterator it = mChunkInfos.begin();
          it != mChunkInfos.end(); ++it) {
         int trackNum = it->mTrack->getTrackId() << 28;
         notify(MEDIA_RECORDER_TRACK_EVENT_INFO,
@@ -809,20 +831,20 @@ void MPEG4Writer::sendSessionSummary() {
     }
 }
 
-status_t MPEG4Writer::setInterleaveDuration(uint32_t durationUs) {
+status_t MoofWriter::setInterleaveDuration(uint32_t durationUs) {
     mInterleaveDurationUs = durationUs;
     return OK;
 }
 
-void MPEG4Writer::lock() {
+void MoofWriter::lock() {
     mLock.lock();
 }
 
-void MPEG4Writer::unlock() {
+void MoofWriter::unlock() {
     mLock.unlock();
 }
 
-off64_t MPEG4Writer::addSample_l(MediaBuffer *buffer) {
+off64_t MoofWriter::addSample_l(MediaBuffer *buffer) {
     off64_t old_offset = mOffset;
 
     ::write(mFd,
@@ -848,7 +870,7 @@ static void StripStartcode(MediaBuffer *buffer) {
     }
 }
 
-off64_t MPEG4Writer::addLengthPrefixedSample_l(MediaBuffer *buffer) {
+off64_t MoofWriter::addLengthPrefixedSample_l(MediaBuffer *buffer) {
     off64_t old_offset = mOffset;
 
     size_t length = buffer->range_length();
@@ -882,7 +904,7 @@ off64_t MPEG4Writer::addLengthPrefixedSample_l(MediaBuffer *buffer) {
     return old_offset;
 }
 
-size_t MPEG4Writer::write(
+size_t MoofWriter::write(
         const void *ptr, size_t size, size_t nmemb) {
 
     const size_t bytes = size * nmemb;
@@ -890,24 +912,9 @@ size_t MPEG4Writer::write(
         // This happens only when we write the moov box at the end of
         // recording, not for each output video/audio frame we receive.
         off64_t moovBoxSize = 8 + mMoovBoxBufferOffset + bytes;
-        if (moovBoxSize > mEstimatedMoovBoxSize) {
-            for (List<off64_t>::iterator it = mBoxes.begin();
-                 it != mBoxes.end(); ++it) {
-                (*it) += mOffset;
-            }
-            lseek64(mFd, mOffset, SEEK_SET);
-            ::write(mFd, mMoovBoxBuffer, mMoovBoxBufferOffset);
-            ::write(mFd, ptr, size * nmemb);
-            mOffset += (bytes + mMoovBoxBufferOffset);
-            free(mMoovBoxBuffer);
-            mMoovBoxBuffer = NULL;
-            mMoovBoxBufferOffset = 0;
-            mWriteMoovBoxToMemory = false;
-            mStreamableFile = false;
-        } else {
-            memcpy(mMoovBoxBuffer + mMoovBoxBufferOffset, ptr, bytes);
-            mMoovBoxBufferOffset += bytes;
-        }
+        CHECK(moovBoxSize <= mEstimatedMoovBoxSize);
+        memcpy(mMoovBoxBuffer + mMoovBoxBufferOffset, ptr, bytes);
+        mMoovBoxBufferOffset += bytes;
     } else {
         ::write(mFd, ptr, size * nmemb);
         mOffset += bytes;
@@ -915,7 +922,7 @@ size_t MPEG4Writer::write(
     return bytes;
 }
 
-void MPEG4Writer::beginBox(const char *fourcc) {
+void MoofWriter::beginBox(const char *fourcc) {
     CHECK_EQ(strlen(fourcc), 4);
 
     mBoxes.push_back(mWriteMoovBoxToMemory?
@@ -925,55 +932,49 @@ void MPEG4Writer::beginBox(const char *fourcc) {
     writeFourcc(fourcc);
 }
 
-void MPEG4Writer::endBox() {
+void MoofWriter::endBox() {
     CHECK(!mBoxes.empty());
 
     off64_t offset = *--mBoxes.end();
     mBoxes.erase(--mBoxes.end());
 
-    if (mWriteMoovBoxToMemory) {
-       int32_t x = htonl(mMoovBoxBufferOffset - offset);
-       memcpy(mMoovBoxBuffer + offset, &x, 4);
-    } else {
-        lseek64(mFd, offset, SEEK_SET);
-        writeInt32(mOffset - offset);
-        mOffset -= 4;
-        lseek64(mFd, mOffset, SEEK_SET);
-    }
+    CHECK(mWriteMoovBoxToMemory);
+    int32_t x = htonl(mMoovBoxBufferOffset - offset);
+    memcpy(mMoovBoxBuffer + offset, &x, 4);
 }
 
-void MPEG4Writer::writeInt8(int8_t x) {
+void MoofWriter::writeInt8(int8_t x) {
     write(&x, 1, 1);
 }
 
-void MPEG4Writer::writeInt16(int16_t x) {
+void MoofWriter::writeInt16(int16_t x) {
     x = htons(x);
     write(&x, 1, 2);
 }
 
-void MPEG4Writer::writeInt32(int32_t x) {
+void MoofWriter::writeInt32(int32_t x) {
     x = htonl(x);
     write(&x, 1, 4);
 }
 
-void MPEG4Writer::writeInt64(int64_t x) {
+void MoofWriter::writeInt64(int64_t x) {
     x = hton64(x);
     write(&x, 1, 8);
 }
 
-void MPEG4Writer::writeCString(const char *s) {
+void MoofWriter::writeCString(const char *s) {
     size_t n = strlen(s);
     write(s, 1, n + 1);
 }
 
-void MPEG4Writer::writeFourcc(const char *s) {
+void MoofWriter::writeFourcc(const char *s) {
     CHECK_EQ(strlen(s), 4);
     write(s, 1, 4);
 }
 
 
 // Written in +/-DD.DDDD format
-void MPEG4Writer::writeLatitude(int degreex10000) {
+void MoofWriter::writeLatitude(int degreex10000) {
     bool isNegative = (degreex10000 < 0);
     char sign = isNegative? '-': '+';
 
@@ -998,7 +999,7 @@ void MPEG4Writer::writeLatitude(int degreex10000) {
 }
 
 // Written in +/- DDD.DDDD format
-void MPEG4Writer::writeLongitude(int degreex10000) {
+void MoofWriter::writeLongitude(int degreex10000) {
     bool isNegative = (degreex10000 < 0);
     char sign = isNegative? '-': '+';
 
@@ -1029,7 +1030,7 @@ void MPEG4Writer::writeLongitude(int degreex10000) {
  * The range for the latitude is in [-90, +90], and
  * The range for the longitude is in [-180, +180]
  */
-status_t MPEG4Writer::setGeoData(int latitudex10000, int longitudex10000) {
+status_t MoofWriter::setGeoData(int latitudex10000, int longitudex10000) {
     // Is latitude or longitude out of range?
     if (latitudex10000 < -900000 || latitudex10000 > 900000 ||
         longitudex10000 < -1800000 || longitudex10000 > 1800000) {
@@ -1042,15 +1043,15 @@ status_t MPEG4Writer::setGeoData(int latitudex10000, int longitudex10000) {
     return OK;
 }
 
-void MPEG4Writer::write(const void *data, size_t size) {
+void MoofWriter::write(const void *data, size_t size) {
     write(data, 1, size);
 }
 
-bool MPEG4Writer::isFileStreamable() const {
-    return mStreamableFile;
+bool MoofWriter::isFileStreamable() const {
+    return true;
 }
 
-bool MPEG4Writer::exceedsFileSizeLimit() {
+bool MoofWriter::exceedsFileSizeLimit() {
     // No limit
     if (mMaxFileSizeLimitBytes == 0) {
         return false;
@@ -1068,7 +1069,7 @@ bool MPEG4Writer::exceedsFileSizeLimit() {
     return (nTotalBytesEstimate >= (95 * mMaxFileSizeLimitBytes) / 100);
 }
 
-bool MPEG4Writer::exceedsFileDurationLimit() {
+bool MoofWriter::exceedsFileDurationLimit() {
     // No limit
     if (mMaxFileDurationLimitUs == 0) {
         return false;
@@ -1083,7 +1084,7 @@ bool MPEG4Writer::exceedsFileDurationLimit() {
     return false;
 }
 
-bool MPEG4Writer::reachedEOS() {
+bool MoofWriter::reachedEOS() {
     bool allDone = true;
     for (List<Track *>::iterator it = mTracks.begin();
          it != mTracks.end(); ++it) {
@@ -1096,7 +1097,7 @@ bool MPEG4Writer::reachedEOS() {
     return allDone;
 }
 
-void MPEG4Writer::setStartTimestampUs(int64_t timeUs) {
+void MoofWriter::setStartTimestampUs(int64_t timeUs) {
     ALOGI("setStartTimestampUs: %lld", timeUs);
     CHECK_GE(timeUs, 0ll);
     Mutex::Autolock autoLock(mLock);
@@ -1106,20 +1107,20 @@ void MPEG4Writer::setStartTimestampUs(int64_t timeUs) {
     }
 }
 
-int64_t MPEG4Writer::getStartTimestampUs() {
+int64_t MoofWriter::getStartTimestampUs() {
     Mutex::Autolock autoLock(mLock);
     return mStartTimestampUs;
 }
 
-size_t MPEG4Writer::numTracks() {
+size_t MoofWriter::numTracks() {
     Mutex::Autolock autolock(mLock);
     return mTracks.size();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-MPEG4Writer::Track::Track(
-        MPEG4Writer *owner, const sp<MediaSource> &source, size_t trackId)
+MoofWriter::Track::Track(
+        MoofWriter *owner, const sp<MediaSource> &source, size_t trackId)
     : mOwner(owner),
       mMeta(source->getFormat()),
       mSource(source),
@@ -1148,7 +1149,7 @@ MPEG4Writer::Track::Track(
     setTimeScale();
 }
 
-void MPEG4Writer::Track::updateTrackSizeEstimate() {
+void MoofWriter::Track::updateTrackSizeEstimate() {
 
     int64_t stcoBoxSizeBytes = mOwner->use32BitFileOffset()
                                 ? mNumStcoTableEntries * 4
@@ -1160,56 +1161,17 @@ void MPEG4Writer::Track::updateTrackSizeEstimate() {
     if (!mOwner->isFileStreamable()) {
         // Reserved free space is not large enough to hold
         // all meta data and thus wasted.
-        mEstimatedTrackSizeBytes += mNumStscTableEntries * 12 +  // stsc box size
-                                    mNumStssTableEntries * 4 +   // stss box size
-                                    mNumSttsTableEntries * 8 +   // stts box size
-                                    mNumCttsTableEntries * 8 +   // ctts box size
-                                    stcoBoxSizeBytes +           // stco box size
+        mEstimatedTrackSizeBytes += stcoBoxSizeBytes +           // stco box size
                                     stszBoxSizeBytes;            // stsz box size
     }
 }
 
-void MPEG4Writer::Track::addOneStscTableEntry(
-        size_t chunkId, size_t sampleId) {
-
-        StscTableEntry stscEntry(chunkId, sampleId, 1);
-        mStscTableEntries.push_back(stscEntry);
-        ++mNumStscTableEntries;
-}
-
-void MPEG4Writer::Track::addOneStssTableEntry(size_t sampleId) {
-    mStssTableEntries.push_back(sampleId);
-    ++mNumStssTableEntries;
-}
-
-void MPEG4Writer::Track::addOneSttsTableEntry(
-        size_t sampleCount, int32_t duration) {
-
-    if (duration == 0) {
-        ALOGW("0-duration samples found: %d", sampleCount);
-    }
-    SttsTableEntry sttsEntry(sampleCount, duration);
-    mSttsTableEntries.push_back(sttsEntry);
-    ++mNumSttsTableEntries;
-}
-
-void MPEG4Writer::Track::addOneCttsTableEntry(
-        size_t sampleCount, int32_t duration) {
-
-    if (mIsAudio) {
-        return;
-    }
-    CttsTableEntry cttsEntry(sampleCount, duration);
-    mCttsTableEntries.push_back(cttsEntry);
-    ++mNumCttsTableEntries;
-}
-
-void MPEG4Writer::Track::addChunkOffset(off64_t offset) {
+void MoofWriter::Track::addChunkOffset(off64_t offset) {
     ++mNumStcoTableEntries;
-    mChunkOffsets.push_back(offset);
+    //mChunkOffsets.push_back(offset);
 }
 
-void MPEG4Writer::Track::setTimeScale() {
+void MoofWriter::Track::setTimeScale() {
     ALOGV("setTimeScale");
     // Default time scale
     mTimeScale = 90000;
@@ -1231,7 +1193,7 @@ void MPEG4Writer::Track::setTimeScale() {
     CHECK_GT(mTimeScale, 0);
 }
 
-void MPEG4Writer::Track::getCodecSpecificDataFromInputFormatIfPossible() {
+void MoofWriter::Track::getCodecSpecificDataFromInputFormatIfPossible() {
     const char *mime;
     CHECK(mMeta->findCString(kKeyMIMEType, &mime));
 
@@ -1250,6 +1212,9 @@ void MPEG4Writer::Track::getCodecSpecificDataFromInputFormatIfPossible() {
         uint32_t type;
         const void *data;
         size_t size;
+        mMeta->findData(kKeyESDS, &type, &data, &size);
+        ALOGV("getCodecSpecificDataFromInputFormatIfPossible mime=%s type=%d data=%p size=%d",
+              mime, type, data, size);
         if (mMeta->findData(kKeyESDS, &type, &data, &size)) {
             ESDS esds(data, size);
             if (esds.getCodecSpecificInfo(&data, &size) == OK) {
@@ -1262,7 +1227,7 @@ void MPEG4Writer::Track::getCodecSpecificDataFromInputFormatIfPossible() {
     }
 }
 
-MPEG4Writer::Track::~Track() {
+MoofWriter::Track::~Track() {
     stop();
 
     if (mCodecSpecificData != NULL) {
@@ -1277,7 +1242,7 @@ MPEG4Writer::Track::~Track() {
     }
 }
 
-void MPEG4Writer::Track::initTrackingProgressStatus(MetaData *params) {
+void MoofWriter::Track::initTrackingProgressStatus(MetaData *params) {
     ALOGV("initTrackingProgressStatus");
     mPreviousTrackTimeUs = -1;
     mTrackingProgressStatus = false;
@@ -1293,19 +1258,18 @@ void MPEG4Writer::Track::initTrackingProgressStatus(MetaData *params) {
 }
 
 // static
-void *MPEG4Writer::ThreadWrapper(void *me) {
+void *MoofWriter::ThreadWrapper(void *me) {
     ALOGV("ThreadWrapper: %p", me);
-    MPEG4Writer *writer = static_cast<MPEG4Writer *>(me);
+    MoofWriter *writer = static_cast<MoofWriter *>(me);
     writer->threadFunc();
     return NULL;
 }
 
-void MPEG4Writer::bufferChunk(const Chunk& chunk) {
-    ALOGV("bufferChunk: %p", chunk.mTrack);
+void MoofWriter::bufferChunk(const Chunk& chunk) {
     Mutex::Autolock autolock(mLock);
     CHECK_EQ(mDone, false);
 
-    for (List<ChunkInfo>::iterator it = mChunkInfos.begin();
+    for (Vector<ChunkInfo>::iterator it = mChunkInfos.begin();
          it != mChunkInfos.end(); ++it) {
 
         if (chunk.mTrack == it->mTrack) {  // Found owner
@@ -1318,34 +1282,35 @@ void MPEG4Writer::bufferChunk(const Chunk& chunk) {
     CHECK(!"Received a chunk for a unknown track");
 }
 
-void MPEG4Writer::writeChunkToFile(Chunk* chunk) {
-    ALOGV("writeChunkToFile: %lld from %s track",
-        chunk->mTimeStampUs, chunk->mTrack->isAudio()? "audio": "video");
-
+void MoofWriter::writeChunkToFile(Chunk* chunk) 
+{
     int32_t isFirstSample = true;
-    while (!chunk->mSamples.empty()) {
-        List<MediaBuffer *>::iterator it = chunk->mSamples.begin();
 
-        off64_t offset = chunk->mTrack->isAvc()
-                                ? addLengthPrefixedSample_l(*it)
-                                : addSample_l(*it);
+    MediaBuffer * mediaBuffer = chunk->mSamples;
+    ChunkInfo &chunkInfo = mChunkInfos.editItemAt(chunk->mTrack->getTrackId());
 
-        if (isFirstSample) {
-            chunk->mTrack->addChunkOffset(offset);
-            isFirstSample = false;
-        }
+    off64_t offset = chunk->mTrack->isAvc()
+        ? addLengthPrefixedSample_l(mediaBuffer)
+        : addSample_l(mediaBuffer);
 
-        (*it)->release();
-        (*it) = NULL;
-        chunk->mSamples.erase(it);
+    if (isFirstSample) {
+        chunk->mTrack->addChunkOffset(offset);
+        isFirstSample = false;
     }
-    chunk->mSamples.clear();
+
+    chunkInfo.mSampleDurationTicks = chunk->mDurationTicks;
+    chunkInfo.mSampleSize = mediaBuffer->size();
+
+    mediaBuffer->release();
+    chunk->mSamples = NULL;
+
 }
 
-void MPEG4Writer::writeAllChunks() {
+void MoofWriter::writeAllChunks() {
     ALOGV("writeAllChunks");
     size_t outstandingChunks = 0;
     Chunk chunk;
+    ChunkInfo *chunkInfo;
     while (findChunkToWrite(&chunk)) {
         writeChunkToFile(&chunk);
         ++outstandingChunks;
@@ -1354,15 +1319,18 @@ void MPEG4Writer::writeAllChunks() {
     sendSessionSummary();
 
     mChunkInfos.clear();
+    int status = close(mFd);
+    ALOGD("writeAllChunks closed fd status=%d errno=%d", status, errno);
+    mFd = -1;
     ALOGD("%d chunks are written in the last batch", outstandingChunks);
 }
 
-bool MPEG4Writer::findChunkToWrite(Chunk *chunk) {
-    ALOGV("findChunkToWrite");
+bool MoofWriter::findChunkToWrite(Chunk *chunk) {
+    //ALOGV("findChunkToWrite");
 
     int64_t minTimestampUs = 0x7FFFFFFFFFFFFFFFLL;
     Track *track = NULL;
-    for (List<ChunkInfo>::iterator it = mChunkInfos.begin();
+    for (Vector<ChunkInfo>::iterator it = mChunkInfos.begin();
          it != mChunkInfos.end(); ++it) {
         if (!it->mChunks.empty()) {
             List<Chunk>::iterator chunkIt = it->mChunks.begin();
@@ -1374,7 +1342,7 @@ bool MPEG4Writer::findChunkToWrite(Chunk *chunk) {
     }
 
     if (track == NULL) {
-        ALOGV("Nothing to be written after all");
+        //ALOGV("Nothing to be written after all");
         return false;
     }
 
@@ -1382,32 +1350,38 @@ bool MPEG4Writer::findChunkToWrite(Chunk *chunk) {
         mIsFirstChunk = false;
     }
 
-    for (List<ChunkInfo>::iterator it = mChunkInfos.begin();
-         it != mChunkInfos.end(); ++it) {
-        if (it->mTrack == track) {
-            *chunk = *(it->mChunks.begin());
-            it->mChunks.erase(it->mChunks.begin());
-            CHECK_EQ(chunk->mTrack, track);
+    ChunkInfo *chunkInfo = &mChunkInfos.editItemAt(track->getTrackId());
+    *chunk = *(chunkInfo->mChunks.begin());
+    chunkInfo->mChunks.erase(chunkInfo->mChunks.begin());
+    CHECK_EQ(chunk->mTrack, track);
 
-            int64_t interChunkTimeUs =
-                chunk->mTimeStampUs - it->mPrevChunkTimestampUs;
-            if (interChunkTimeUs > it->mPrevChunkTimestampUs) {
-                it->mMaxInterChunkDurUs = interChunkTimeUs;
-            }
+    int64_t interChunkTimeUs =
+        chunk->mTimeStampUs - chunkInfo->mPrevChunkTimestampUs;
+    if (interChunkTimeUs > chunkInfo->mPrevChunkTimestampUs)
+        chunkInfo->mMaxInterChunkDurUs = interChunkTimeUs;
 
-            return true;
-        }
-    }
-
-    return false;
+    return true;
 }
 
-void MPEG4Writer::threadFunc() {
+void MoofWriter::threadFunc() {
     ALOGV("threadFunc");
 
-    prctl(PR_SET_NAME, (unsigned long)"MPEG4Writer", 0, 0, 0);
+    prctl(PR_SET_NAME, (unsigned long)"MoofWriter", 0, 0, 0);
 
     Mutex::Autolock autoLock(mLock);
+    bool startMoofBox = true;
+    bool wroteMoovBox = false;
+    int64_t chunkStartTimeUs = 0;
+
+    ALOGV("threadFunc mDone=%d\n", mDone);
+    while (!mDone && (mGotAllCodecSpecificData<2)) {
+            mChunkReadyCondition.wait(mLock);
+    }
+    ALOGD("got all codec specific data=%d", mGotAllCodecSpecificData);
+
+    mEstimatedMoovBoxSize = 4096;
+    mMoovBoxBuffer = (uint8_t *)malloc(mEstimatedMoovBoxSize);
+
     while (!mDone) {
         Chunk chunk;
         bool chunkFound = false;
@@ -1416,19 +1390,92 @@ void MPEG4Writer::threadFunc() {
             mChunkReadyCondition.wait(mLock);
         }
 
-        // Actual write without holding the lock in order to
-        // reduce the blocking time for media track threads.
         if (chunkFound) {
+
+            mWriteMoovBoxToMemory = true;
+            mMoovBoxBufferOffset = 0;
+
+            if (!wroteMoovBox) {
+                writeFtypBox();
+                writeMoovBox(chunk.mTimeStampUs);
+                wroteMoovBox = true;
+            }
+
+            if (0)
+            ALOGV("Starting MOOF box mOffset=%lld mTimeStampUs=%lld durationTicks=%lld\n", 
+                  mOffset, chunk.mTimeStampUs, chunk.mDurationTicks);
+            chunkStartTimeUs = chunk.mTimeStampUs;
+            ChunkInfo &chunkInfo = mChunkInfos.editItemAt(chunk.mTrack->getTrackId());
+
+            chunkInfo.mSampleCount++;
+            chunkInfo.mSampleDurationTicks = chunk.mDurationTicks;
+            chunkInfo.mBaseMediaDecodeTimeUs = chunk.mTimeStampUs;
+            chunkInfo.mSampleSize = chunk.mSamples->size();
+
+            writeMoofBox(chunk.mDurationTicks, chunk);
+
+            int64_t fileOffset = mOffset;
+            fileOffset += mMoovBoxBufferOffset;
+            fileOffset += 8;
+            fileOffset = hton64(fileOffset);
+            // fix up the tfhd data offset
+            memcpy(mMoovBoxBuffer+mDataOffsetOffset,
+                   (char *)&fileOffset, sizeof(fileOffset));
+
+            int64_t sampleSize = chunk.mSamples->range_length();
+            int32_t mdatlen = sampleSize+8;
+            if (chunk.mTrack->isAvc()) {
+                // NAL length is prepended to sample
+                if (mUse4ByteNalLength)
+                    mdatlen += 4;
+                else
+                    mdatlen += 2;
+            }
+
+            if (mUse32BitOffset) {
+
+                mdatlen = htonl(mdatlen);
+
+                memcpy(mMoovBoxBuffer+mMoovBoxBufferOffset, (char*)&mdatlen, sizeof(mdatlen));
+                mMoovBoxBufferOffset += sizeof(mdatlen);
+                memcpy(mMoovBoxBuffer+mMoovBoxBufferOffset, "mdat", 4);
+                mMoovBoxBufferOffset += 4;
+
+            } else {
+                mdatlen += 8;
+                mdatlen = hton64(mdatlen);
+
+                memcpy(mMoovBoxBuffer+mMoovBoxBufferOffset, "\x00\x00\x00\x01mdat", 8);
+                mMoovBoxBufferOffset += 8;
+                memcpy(mMoovBoxBuffer+mMoovBoxBufferOffset,
+                       (char*)&mdatlen, sizeof(mdatlen));
+                mMoovBoxBufferOffset += sizeof(mdatlen);
+            }
+
+            // Actual write without holding the lock in order to
+            // reduce the blocking time for media track threads.
             mLock.unlock();
+
+            ::write(mFd, mMoovBoxBuffer, mMoovBoxBufferOffset);
+            mOffset += mMoovBoxBufferOffset;
+
+            mWriteMoovBoxToMemory = false;
+
             writeChunkToFile(&chunk);
             mLock.lock();
+
         }
+    }
+    ALOGD("Moof writer done");
+    if (mMoovBoxBuffer != NULL) {
+        free(mMoovBoxBuffer);
+        mMoovBoxBuffer = NULL;
     }
 
     writeAllChunks();
 }
 
-status_t MPEG4Writer::startWriterThread() {
+status_t MoofWriter::startWriterThread() {
     ALOGV("startWriterThread");
 
     mDone = false;
@@ -1438,6 +1485,9 @@ status_t MPEG4Writer::startWriterThread() {
          it != mTracks.end(); ++it) {
         ChunkInfo info;
         info.mTrack = *it;
+        info.mSampleCount = 0;
+        info.mSampleDurationTicks = 0;
+        info.mSampleSize = 0;
         info.mPrevChunkTimestampUs = 0;
         info.mMaxInterChunkDurUs = 0;
         mChunkInfos.push_back(info);
@@ -1453,7 +1503,9 @@ status_t MPEG4Writer::startWriterThread() {
 }
 
 
-status_t MPEG4Writer::Track::start(MetaData *params) {
+status_t MoofWriter::Track::start(MetaData *params) {
+    ALOGV("MoofWriter::Track::start %s done=%d paused=%d\n",
+          mIsAudio ? "Audio" : "Video", mDone, mPaused);
     if (!mDone && mPaused) {
         mPaused = false;
         mResumed = true;
@@ -1518,10 +1570,6 @@ status_t MPEG4Writer::Track::start(MetaData *params) {
     mReachedEOS = false;
     mEstimatedTrackSizeBytes = 0;
     mNumStcoTableEntries = 0;
-    mNumStssTableEntries = 0;
-    mNumStscTableEntries = 0;
-    mNumSttsTableEntries = 0;
-    mNumCttsTableEntries = 0;
     mMdatSizeBytes = 0;
 
     mMaxChunkDurationUs = 0;
@@ -1532,12 +1580,12 @@ status_t MPEG4Writer::Track::start(MetaData *params) {
     return OK;
 }
 
-status_t MPEG4Writer::Track::pause() {
+status_t MoofWriter::Track::pause() {
     mPaused = true;
     return OK;
 }
 
-status_t MPEG4Writer::Track::stop() {
+status_t MoofWriter::Track::stop() {
     ALOGD("Stopping %s track", mIsAudio? "Audio": "Video");
     if (!mStarted) {
         ALOGE("Stop() called but track is not started");
@@ -1566,12 +1614,12 @@ status_t MPEG4Writer::Track::stop() {
     return err;
 }
 
-bool MPEG4Writer::Track::reachedEOS() {
+bool MoofWriter::Track::reachedEOS() {
     return mReachedEOS;
 }
 
 // static
-void *MPEG4Writer::Track::ThreadWrapper(void *me) {
+void *MoofWriter::Track::ThreadWrapper(void *me) {
     Track *track = static_cast<Track *>(me);
 
     status_t err = track->threadEntry();
@@ -1601,7 +1649,7 @@ static const uint8_t *findNextStartCode(
     return &data[length - bytesLeft];
 }
 
-const uint8_t *MPEG4Writer::Track::parseParamSet(
+const uint8_t *MoofWriter::Track::parseParamSet(
         const uint8_t *data, size_t length, int type, size_t *paramSetLen) {
 
     ALOGV("parseParamSet");
@@ -1640,7 +1688,7 @@ const uint8_t *MPEG4Writer::Track::parseParamSet(
     return nextStartCode;
 }
 
-status_t MPEG4Writer::Track::copyAVCCodecSpecificData(
+status_t MoofWriter::Track::copyAVCCodecSpecificData(
         const uint8_t *data, size_t size) {
     ALOGV("copyAVCCodecSpecificData");
 
@@ -1657,7 +1705,7 @@ status_t MPEG4Writer::Track::copyAVCCodecSpecificData(
     return OK;
 }
 
-status_t MPEG4Writer::Track::parseAVCCodecSpecificData(
+status_t MoofWriter::Track::parseAVCCodecSpecificData(
         const uint8_t *data, size_t size) {
 
     ALOGV("parseAVCCodecSpecificData");
@@ -1750,8 +1798,10 @@ status_t MPEG4Writer::Track::parseAVCCodecSpecificData(
     return OK;
 }
 
-status_t MPEG4Writer::Track::makeAVCCodecSpecificData(
+status_t MoofWriter::Track::makeAVCCodecSpecificData(
         const uint8_t *data, size_t size) {
+
+    ALOGV("makeAVCCodecSpecificData");
 
     if (mCodecSpecificData != NULL) {
         ALOGE("Already have codec specific data");
@@ -1831,7 +1881,7 @@ status_t MPEG4Writer::Track::makeAVCCodecSpecificData(
  * weight to more recently drift time. The filter coefficients, 0.5 and 0.5,
  * are heuristically determined.
  */
-void MPEG4Writer::Track::updateDriftTime(const sp<MetaData>& meta) {
+void MoofWriter::Track::updateDriftTime(const sp<MetaData>& meta) {
     int64_t driftTimeUs = 0;
     if (meta->findInt64(kKeyDriftTime, &driftTimeUs)) {
         int64_t prevDriftTimeUs = mOwner->getDriftTimeUs();
@@ -1840,7 +1890,7 @@ void MPEG4Writer::Track::updateDriftTime(const sp<MetaData>& meta) {
     }
 }
 
-status_t MPEG4Writer::Track::threadEntry() {
+status_t MoofWriter::Track::threadEntry() {
     int32_t count = 0;
     const int64_t interleaveDurationUs = mOwner->interleaveDuration();
     const bool hasMultipleTracks = (mOwner->numTracks() > 1);
@@ -1867,7 +1917,7 @@ status_t MPEG4Writer::Track::threadEntry() {
     }
     androidSetThreadPriority(0, ANDROID_PRIORITY_AUDIO);
 
-    sp<MetaData> meta_data;
+    sp<MetaData> metaData;
 
     mNumSamples = 0;
     status_t err = OK;
@@ -1896,6 +1946,9 @@ status_t MPEG4Writer::Track::threadEntry() {
                 && isCodecConfig) {
             CHECK(!mGotAllCodecSpecificData);
 
+            ALOGV("got %s codec config %d bytes",
+                  mIsAudio ? "audio" : "video",
+                  buffer->range_length());
             if (mIsAvc) {
                 status_t err = makeAVCCodecSpecificData(
                         (const uint8_t *)buffer->data()
@@ -1914,6 +1967,8 @@ status_t MPEG4Writer::Track::threadEntry() {
             buffer->release();
             buffer = NULL;
 
+            ALOGD("notify got all CodecSpecificData");
+            mOwner->notifyGotAllCodecSpecificData();
             mGotAllCodecSpecificData = true;
             continue;
         }
@@ -1924,7 +1979,7 @@ status_t MPEG4Writer::Track::threadEntry() {
         memcpy(copy->data(), (uint8_t *)buffer->data() + buffer->range_offset(),
                 buffer->range_length());
         copy->set_range(0, buffer->range_length());
-        meta_data = new MetaData(*buffer->meta_data().get());
+        metaData = new MetaData(*buffer->meta_data().get());
         buffer->release();
         buffer = NULL;
 
@@ -1954,8 +2009,8 @@ status_t MPEG4Writer::Track::threadEntry() {
 
 
         int32_t isSync = false;
-        meta_data->findInt32(kKeyIsSyncFrame, &isSync);
-        CHECK(meta_data->findInt64(kKeyTime, &timestampUs));
+        metaData->findInt32(kKeyIsSyncFrame, &isSync);
+        CHECK(metaData->findInt64(kKeyTime, &timestampUs));
 
 ////////////////////////////////////////////////////////////////////////////////
         if (mNumSamples == 0) {
@@ -1983,14 +2038,15 @@ status_t MPEG4Writer::Track::threadEntry() {
              * Composition time offset = composition time - decoding time
              */
             int64_t decodingTimeUs;
-            CHECK(meta_data->findInt64(kKeyDecodingTime, &decodingTimeUs));
+            CHECK(metaData->findInt64(kKeyDecodingTime, &decodingTimeUs));
             decodingTimeUs -= previousPausedDurationUs;
             cttsOffsetTimeUs =
                     timestampUs + kMaxCttsOffsetTimeUs - decodingTimeUs;
             CHECK_GE(cttsOffsetTimeUs, 0ll);
             timestampUs = decodingTimeUs;
-            ALOGV("decoding time: %lld and ctts offset time: %lld",
-                timestampUs, cttsOffsetTimeUs);
+            if (0)
+            ALOGV("decoding time: %lld ctts offset time: %lld",
+                  decodingTimeUs, cttsOffsetTimeUs);
 
             // Update ctts box table if necessary
             currCttsOffsetTimeTicks =
@@ -2001,11 +2057,9 @@ status_t MPEG4Writer::Track::threadEntry() {
                 // so that we can do adjustment for the initial track start
                 // time offset easily in writeCttsBox().
                 lastCttsOffsetTimeTicks = currCttsOffsetTimeTicks;
-                addOneCttsTableEntry(1, currCttsOffsetTimeTicks);
                 cttsSampleCount = 0;      // No sample in ctts box is pending
             } else {
                 if (currCttsOffsetTimeTicks != lastCttsOffsetTimeTicks) {
-                    addOneCttsTableEntry(cttsSampleCount, lastCttsOffsetTimeTicks);
                     lastCttsOffsetTimeTicks = currCttsOffsetTimeTicks;
                     cttsSampleCount = 1;  // One sample in ctts box is pending
                 } else {
@@ -2029,11 +2083,12 @@ status_t MPEG4Writer::Track::threadEntry() {
 
         if (mIsRealTimeRecording) {
             if (mIsAudio) {
-                updateDriftTime(meta_data);
+                updateDriftTime(metaData);
             }
         }
 
         CHECK_GE(timestampUs, 0ll);
+        if (0)
         ALOGV("%s media time stamp: %lld and previous paused duration %lld",
                 mIsAudio? "Audio": "Video", timestampUs, previousPausedDurationUs);
         if (timestampUs > mTrackDurationUs) {
@@ -2064,7 +2119,6 @@ status_t MPEG4Writer::Track::threadEntry() {
             // Force the first sample to have its own stts entry so that
             // we can adjust its value later to maintain the A/V sync.
             if (mNumSamples == 3 || currDurationTicks != lastDurationTicks) {
-                addOneSttsTableEntry(sampleCount, lastDurationTicks);
                 sampleCount = 1;
             } else {
                 ++sampleCount;
@@ -2077,15 +2131,13 @@ status_t MPEG4Writer::Track::threadEntry() {
             }
             previousSampleSize = sampleSize;
         }
-        ALOGV("%s timestampUs/lastTimestampUs: %lld/%lld",
-                mIsAudio? "Audio": "Video", timestampUs, lastTimestampUs);
+        if (0)
+        ALOGV("%s timestampUs/lastTimestampUs: %lld/%lld sampleSize=%d haveSameSize=%d",
+              mIsAudio? "Audio": "Video", timestampUs, lastTimestampUs,
+              sampleSize, mSamplesHaveSameSize);
         lastDurationUs = timestampUs - lastTimestampUs;
         lastDurationTicks = currDurationTicks;
         lastTimestampUs = timestampUs;
-
-        if (isSync != 0) {
-            addOneStssTableEntry(mNumSamples);
-        }
 
         if (mTrackingProgressStatus) {
             if (mPreviousTrackTimeUs <= 0) {
@@ -2093,42 +2145,8 @@ status_t MPEG4Writer::Track::threadEntry() {
             }
             trackProgressStatus(timestampUs);
         }
-        if (!hasMultipleTracks) {
-            off64_t offset = mIsAvc? mOwner->addLengthPrefixedSample_l(copy)
-                                 : mOwner->addSample_l(copy);
-            if (mChunkOffsets.empty()) {
-                addChunkOffset(offset);
-            }
-            copy->release();
-            copy = NULL;
-            continue;
-        }
 
-        mChunkSamples.push_back(copy);
-        if (interleaveDurationUs == 0) {
-            addOneStscTableEntry(++nChunks, 1);
-            bufferChunk(timestampUs);
-        } else {
-            if (chunkTimestampUs == 0) {
-                chunkTimestampUs = timestampUs;
-            } else {
-                int64_t chunkDurationUs = timestampUs - chunkTimestampUs;
-                if (chunkDurationUs > interleaveDurationUs) {
-                    if (chunkDurationUs > mMaxChunkDurationUs) {
-                        mMaxChunkDurationUs = chunkDurationUs;
-                    }
-                    ++nChunks;
-                    if (nChunks == 1 ||  // First chunk
-                        (--(mStscTableEntries.end()))->samplesPerChunk !=
-                         mChunkSamples.size()) {
-                        addOneStscTableEntry(nChunks, mChunkSamples.size());
-                    }
-                    bufferChunk(timestampUs);
-                    chunkTimestampUs = timestampUs;
-                }
-            }
-        }
-
+        bufferChunk(timestampUs, currDurationTicks, copy);
     }
 
     if (isTrackMalFormed()) {
@@ -2136,14 +2154,6 @@ status_t MPEG4Writer::Track::threadEntry() {
     }
 
     mOwner->trackProgressStatus(mTrackId, -1, err);
-
-    // Last chunk
-    if (!hasMultipleTracks) {
-        addOneStscTableEntry(1, mNumSamples);
-    } else if (!mChunkSamples.empty()) {
-        addOneStscTableEntry(++nChunks, mChunkSamples.size());
-        bufferChunk(timestampUs);
-    }
 
     // We don't really know how long the last frame lasts, since
     // there is no frame time after it, just repeat the previous
@@ -2153,23 +2163,6 @@ status_t MPEG4Writer::Track::threadEntry() {
         lastDurationTicks = 0;
     } else {
         ++sampleCount;  // Count for the last sample
-    }
-
-    if (mNumSamples <= 2) {
-        addOneSttsTableEntry(1, lastDurationTicks);
-        if (sampleCount - 1 > 0) {
-            addOneSttsTableEntry(sampleCount - 1, lastDurationTicks);
-        }
-    } else {
-        addOneSttsTableEntry(sampleCount, lastDurationTicks);
-    }
-
-    // The last ctts box may not have been written yet, and this
-    // is to make sure that we write out the last ctts box.
-    if (currCttsOffsetTimeTicks == lastCttsOffsetTimeTicks) {
-        if (cttsSampleCount > 0) {
-            addOneCttsTableEntry(cttsSampleCount, lastCttsOffsetTimeTicks);
-        }
     }
 
     mTrackDurationUs += lastDurationUs;
@@ -2189,14 +2182,9 @@ status_t MPEG4Writer::Track::threadEntry() {
     return err;
 }
 
-bool MPEG4Writer::Track::isTrackMalFormed() const {
+bool MoofWriter::Track::isTrackMalFormed() const {
     if (mSampleSizes.empty()) {                      // no samples written
         ALOGE("The number of recorded samples is 0");
-        return true;
-    }
-
-    if (!mIsAudio && mNumStssTableEntries == 0) {  // no sync frames for video
-        ALOGE("There are no sync frames for video track");
         return true;
     }
 
@@ -2207,7 +2195,7 @@ bool MPEG4Writer::Track::isTrackMalFormed() const {
     return false;
 }
 
-void MPEG4Writer::Track::sendTrackSummary(bool hasMultipleTracks) {
+void MoofWriter::Track::sendTrackSummary(bool hasMultipleTracks) {
 
     // Send track summary only if test mode is enabled.
     if (!isTestModeEnabled()) {
@@ -2262,7 +2250,7 @@ void MPEG4Writer::Track::sendTrackSummary(bool hasMultipleTracks) {
     }
 }
 
-void MPEG4Writer::Track::trackProgressStatus(int64_t timeUs, status_t err) {
+void MoofWriter::Track::trackProgressStatus(int64_t timeUs, status_t err) {
     ALOGV("trackProgressStatus: %lld us", timeUs);
     if (mTrackEveryTimeDurationUs > 0 &&
         timeUs - mPreviousTrackTimeUs >= mTrackEveryTimeDurationUs) {
@@ -2272,7 +2260,7 @@ void MPEG4Writer::Track::trackProgressStatus(int64_t timeUs, status_t err) {
     }
 }
 
-void MPEG4Writer::trackProgressStatus(
+void MoofWriter::trackProgressStatus(
         size_t trackId, int64_t timeUs, status_t err) {
     Mutex::Autolock lock(mLock);
     int32_t trackNum = (trackId << 28);
@@ -2299,39 +2287,36 @@ void MPEG4Writer::trackProgressStatus(
     }
 }
 
-void MPEG4Writer::setDriftTimeUs(int64_t driftTimeUs) {
+void MoofWriter::setDriftTimeUs(int64_t driftTimeUs) {
     ALOGV("setDriftTimeUs: %lld us", driftTimeUs);
     Mutex::Autolock autolock(mLock);
     mDriftTimeUs = driftTimeUs;
 }
 
-int64_t MPEG4Writer::getDriftTimeUs() {
+int64_t MoofWriter::getDriftTimeUs() {
     ALOGV("getDriftTimeUs: %lld us", mDriftTimeUs);
     Mutex::Autolock autolock(mLock);
     return mDriftTimeUs;
 }
 
-bool MPEG4Writer::useNalLengthFour() {
+bool MoofWriter::useNalLengthFour() {
     return mUse4ByteNalLength;
 }
 
-void MPEG4Writer::Track::bufferChunk(int64_t timestampUs) {
-    ALOGV("bufferChunk");
-
-    Chunk chunk(this, timestampUs, mChunkSamples);
+void MoofWriter::Track::bufferChunk(int64_t timestampUs, int32_t durationTicks, MediaBuffer *samples) {
+    Chunk chunk(this, timestampUs, durationTicks, samples);
     mOwner->bufferChunk(chunk);
-    mChunkSamples.clear();
 }
 
-int64_t MPEG4Writer::Track::getDurationUs() const {
+int64_t MoofWriter::Track::getDurationUs() const {
     return mTrackDurationUs;
 }
 
-int64_t MPEG4Writer::Track::getEstimatedTrackSizeBytes() const {
+int64_t MoofWriter::Track::getEstimatedTrackSizeBytes() const {
     return mEstimatedTrackSizeBytes;
 }
 
-status_t MPEG4Writer::Track::checkCodecSpecificData() const {
+status_t MoofWriter::Track::checkCodecSpecificData() const {
     const char *mime;
     CHECK(mMeta->findCString(kKeyMIMEType, &mime));
     if (!strcasecmp(MEDIA_MIMETYPE_AUDIO_AAC, mime) ||
@@ -2352,7 +2337,7 @@ status_t MPEG4Writer::Track::checkCodecSpecificData() const {
     return OK;
 }
 
-void MPEG4Writer::Track::writeTrackHeader(bool use32BitOffset) {
+void MoofWriter::Track::writeTrackHeader(bool use32BitOffset) {
 
     ALOGV("%s track time scale: %d",
         mIsAudio? "Audio": "Video", mTimeScale);
@@ -2376,7 +2361,7 @@ void MPEG4Writer::Track::writeTrackHeader(bool use32BitOffset) {
     mOwner->endBox();  // trak
 }
 
-void MPEG4Writer::Track::writeStblBox(bool use32BitOffset) {
+void MoofWriter::Track::writeStblBox(bool use32BitOffset) {
     mOwner->beginBox("stbl");
     mOwner->beginBox("stsd");
     mOwner->writeInt32(0);               // version=0, flags=0
@@ -2388,7 +2373,6 @@ void MPEG4Writer::Track::writeStblBox(bool use32BitOffset) {
     }
     mOwner->endBox();  // stsd
     writeSttsBox();
-    writeCttsBox();
     if (!mIsAudio) {
         writeStssBox();
     }
@@ -2398,7 +2382,7 @@ void MPEG4Writer::Track::writeStblBox(bool use32BitOffset) {
     mOwner->endBox();  // stbl
 }
 
-void MPEG4Writer::Track::writeVideoFourCCBox() {
+void MoofWriter::Track::writeVideoFourCCBox() {
     const char *mime;
     bool success = mMeta->findCString(kKeyMIMEType, &mime);
     CHECK(success);
@@ -2451,7 +2435,7 @@ void MPEG4Writer::Track::writeVideoFourCCBox() {
     mOwner->endBox();  // mp4v, s263 or avc1
 }
 
-void MPEG4Writer::Track::writeAudioFourCCBox() {
+void MoofWriter::Track::writeAudioFourCCBox() {
     const char *mime;
     bool success = mMeta->findCString(kKeyMIMEType, &mime);
     CHECK(success);
@@ -2493,10 +2477,12 @@ void MPEG4Writer::Track::writeAudioFourCCBox() {
     mOwner->endBox();
 }
 
-void MPEG4Writer::Track::writeMp4aEsdsBox() {
+void MoofWriter::Track::writeMp4aEsdsBox() {
     mOwner->beginBox("esds");
-    CHECK(mCodecSpecificData);
-    CHECK_GT(mCodecSpecificDataSize, 0);
+    //CHECK(mCodecSpecificData);
+    //CHECK_GT(mCodecSpecificDataSize, 0);
+    if (mCodecSpecificData == NULL || mCodecSpecificDataSize <= 0)
+        ALOGE("writeMp4aEsdsBox: missing CodecSpecificData");
 
     // Make sure all sizes encode to a single byte.
     CHECK_LT(mCodecSpecificDataSize + 23, 128);
@@ -2519,7 +2505,8 @@ void MPEG4Writer::Track::writeMp4aEsdsBox() {
 
     mOwner->writeInt8(0x05);   // DecoderSpecificInfoTag
     mOwner->writeInt8(mCodecSpecificDataSize);
-    mOwner->write(mCodecSpecificData, mCodecSpecificDataSize);
+    if (mCodecSpecificDataSize)
+        mOwner->write(mCodecSpecificData, mCodecSpecificDataSize);
 
     static const uint8_t kData2[] = {
         0x06,  // SLConfigDescriptorTag
@@ -2531,9 +2518,11 @@ void MPEG4Writer::Track::writeMp4aEsdsBox() {
     mOwner->endBox();  // esds
 }
 
-void MPEG4Writer::Track::writeMp4vEsdsBox() {
-    CHECK(mCodecSpecificData);
-    CHECK_GT(mCodecSpecificDataSize, 0);
+void MoofWriter::Track::writeMp4vEsdsBox() {
+    //CHECK(mCodecSpecificData);
+    //CHECK_GT(mCodecSpecificDataSize, 0);
+    if (mCodecSpecificData == NULL || mCodecSpecificDataSize <= 0)
+        ALOGE("writeMp4vEsdsBox: missing CodecSpecificData");
     mOwner->beginBox("esds");
 
     mOwner->writeInt32(0);    // version=0, flags=0
@@ -2558,7 +2547,8 @@ void MPEG4Writer::Track::writeMp4vEsdsBox() {
     mOwner->writeInt8(0x05);  // DecoderSpecificInfoTag
 
     mOwner->writeInt8(mCodecSpecificDataSize);
-    mOwner->write(mCodecSpecificData, mCodecSpecificDataSize);
+    if (mCodecSpecificDataSize)
+        mOwner->write(mCodecSpecificData, mCodecSpecificDataSize);
 
     static const uint8_t kData2[] = {
         0x06,  // SLConfigDescriptorTag
@@ -2570,7 +2560,7 @@ void MPEG4Writer::Track::writeMp4vEsdsBox() {
     mOwner->endBox();  // esds
 }
 
-void MPEG4Writer::Track::writeTkhdBox(time_t now) {
+void MoofWriter::Track::writeTkhdBox(time_t now) {
     mOwner->beginBox("tkhd");
     // Flags = 7 to indicate that the track is enabled, and
     // part of the presentation
@@ -2608,7 +2598,7 @@ void MPEG4Writer::Track::writeTkhdBox(time_t now) {
     mOwner->endBox();  // tkhd
 }
 
-void MPEG4Writer::Track::writeVmhdBox() {
+void MoofWriter::Track::writeVmhdBox() {
     mOwner->beginBox("vmhd");
     mOwner->writeInt32(0x01);        // version=0, flags=1
     mOwner->writeInt16(0);           // graphics mode
@@ -2618,7 +2608,7 @@ void MPEG4Writer::Track::writeVmhdBox() {
     mOwner->endBox();
 }
 
-void MPEG4Writer::Track::writeSmhdBox() {
+void MoofWriter::Track::writeSmhdBox() {
     mOwner->beginBox("smhd");
     mOwner->writeInt32(0);           // version=0, flags=0
     mOwner->writeInt16(0);           // balance
@@ -2626,7 +2616,7 @@ void MPEG4Writer::Track::writeSmhdBox() {
     mOwner->endBox();
 }
 
-void MPEG4Writer::Track::writeHdlrBox() {
+void MoofWriter::Track::writeHdlrBox() {
     mOwner->beginBox("hdlr");
     mOwner->writeInt32(0);             // version=0, flags=0
     mOwner->writeInt32(0);             // component type: should be mhlr
@@ -2639,7 +2629,7 @@ void MPEG4Writer::Track::writeHdlrBox() {
     mOwner->endBox();
 }
 
-void MPEG4Writer::Track::writeMdhdBox(time_t now) {
+void MoofWriter::Track::writeMdhdBox(time_t now) {
     int64_t trakDurationUs = getDurationUs();
     mOwner->beginBox("mdhd");
     mOwner->writeInt32(0);             // version=0, flags=0
@@ -2658,7 +2648,7 @@ void MPEG4Writer::Track::writeMdhdBox(time_t now) {
     mOwner->endBox();
 }
 
-void MPEG4Writer::Track::writeDamrBox() {
+void MoofWriter::Track::writeDamrBox() {
     // 3gpp2 Spec AMRSampleEntry fields
     mOwner->beginBox("damr");
     mOwner->writeCString("   ");  // vendor: 4 bytes
@@ -2669,7 +2659,7 @@ void MPEG4Writer::Track::writeDamrBox() {
     mOwner->endBox();
 }
 
-void MPEG4Writer::Track::writeUrlBox() {
+void MoofWriter::Track::writeUrlBox() {
     // The table index here refers to the sample description index
     // in the sample table entries.
     mOwner->beginBox("url ");
@@ -2677,7 +2667,7 @@ void MPEG4Writer::Track::writeUrlBox() {
     mOwner->endBox();  // url
 }
 
-void MPEG4Writer::Track::writeDrefBox() {
+void MoofWriter::Track::writeDrefBox() {
     mOwner->beginBox("dref");
     mOwner->writeInt32(0);  // version=0, flags=0
     mOwner->writeInt32(1);  // entry count (either url or urn)
@@ -2685,13 +2675,18 @@ void MPEG4Writer::Track::writeDrefBox() {
     mOwner->endBox();  // dref
 }
 
-void MPEG4Writer::Track::writeDinfBox() {
+void MoofWriter::Track::writeDinfBox() {
     mOwner->beginBox("dinf");
     writeDrefBox();
     mOwner->endBox();  // dinf
 }
 
-void MPEG4Writer::Track::writeAvccBox() {
+void MoofWriter::Track::writeAvccBox() {
+    ALOGV("writeAvccBox mCodecSpecificData=%p size=%d", mCodecSpecificData, mCodecSpecificDataSize);
+    if (!mCodecSpecificData || mCodecSpecificDataSize < 5) {
+        ALOGD("No codec specific data for Avcc box (size=%d)", mCodecSpecificDataSize);
+        return;
+    }
     CHECK(mCodecSpecificData);
     CHECK_GE(mCodecSpecificDataSize, 5);
 
@@ -2704,7 +2699,7 @@ void MPEG4Writer::Track::writeAvccBox() {
     mOwner->endBox();  // avcC
 }
 
-void MPEG4Writer::Track::writeD263Box() {
+void MoofWriter::Track::writeD263Box() {
     mOwner->beginBox("d263");
     mOwner->writeInt32(0);  // vendor
     mOwner->writeInt8(0);   // decoder version
@@ -2714,14 +2709,14 @@ void MPEG4Writer::Track::writeD263Box() {
 }
 
 // This is useful if the pixel is not square
-void MPEG4Writer::Track::writePaspBox() {
+void MoofWriter::Track::writePaspBox() {
     mOwner->beginBox("pasp");
     mOwner->writeInt32(1 << 16);  // hspacing
     mOwner->writeInt32(1 << 16);  // vspacing
     mOwner->endBox();  // pasp
 }
 
-int32_t MPEG4Writer::Track::getStartTimeOffsetScaledTime() const {
+int32_t MoofWriter::Track::getStartTimeOffsetScaledTime() const {
     int64_t trackStartTimeOffsetUs = 0;
     int64_t moovStartTimeUs = mOwner->getStartTimestampUs();
     if (mStartTimestampUs != moovStartTimeUs) {
@@ -2731,125 +2726,67 @@ int32_t MPEG4Writer::Track::getStartTimeOffsetScaledTime() const {
     return (trackStartTimeOffsetUs *  mTimeScale + 500000LL) / 1000000LL;
 }
 
-void MPEG4Writer::Track::writeSttsBox() {
+void MoofWriter::Track::writeSttsBox() {
     mOwner->beginBox("stts");
     mOwner->writeInt32(0);  // version=0, flags=0
-    mOwner->writeInt32(mNumSttsTableEntries);
-
-    // Compensate for small start time difference from different media tracks
-    List<SttsTableEntry>::iterator it = mSttsTableEntries.begin();
-    CHECK(it != mSttsTableEntries.end() && it->sampleCount == 1);
-    mOwner->writeInt32(it->sampleCount);
-    mOwner->writeInt32(getStartTimeOffsetScaledTime() + it->sampleDuration);
-
-    int64_t totalCount = 1;
-    while (++it != mSttsTableEntries.end()) {
-        mOwner->writeInt32(it->sampleCount);
-        mOwner->writeInt32(it->sampleDuration);
-        totalCount += it->sampleCount;
-    }
-    CHECK_EQ(totalCount, mNumSamples);
+    mOwner->writeInt32(0);
     mOwner->endBox();  // stts
 }
 
-void MPEG4Writer::Track::writeCttsBox() {
-    if (mIsAudio) {  // ctts is not for audio
-        return;
-    }
-
-    // There is no B frame at all
-    if (mMinCttsOffsetTimeUs == mMaxCttsOffsetTimeUs) {
-        return;
-    }
-
-    // Do not write ctts box when there is no need to have it.
-    if ((mNumCttsTableEntries == 1 &&
-        mCttsTableEntries.begin()->sampleDuration == 0) ||
-        mNumCttsTableEntries == 0) {
-        return;
-    }
-
-    ALOGD("ctts box has %d entries with range [%lld, %lld]",
-            mNumCttsTableEntries, mMinCttsOffsetTimeUs, mMaxCttsOffsetTimeUs);
-
-    mOwner->beginBox("ctts");
-    // Version 1 allows to use negative offset time value, but
-    // we are sticking to version 0 for now.
-    mOwner->writeInt32(0);  // version=0, flags=0
-    mOwner->writeInt32(mNumCttsTableEntries);
-
-    // Compensate for small start time difference from different media tracks
-    List<CttsTableEntry>::iterator it = mCttsTableEntries.begin();
-    CHECK(it != mCttsTableEntries.end() && it->sampleCount == 1);
-    mOwner->writeInt32(it->sampleCount);
-    mOwner->writeInt32(getStartTimeOffsetScaledTime() +
-            it->sampleDuration - mMinCttsOffsetTimeUs);
-
-    int64_t totalCount = 1;
-    while (++it != mCttsTableEntries.end()) {
-        mOwner->writeInt32(it->sampleCount);
-        mOwner->writeInt32(it->sampleDuration - mMinCttsOffsetTimeUs);
-        totalCount += it->sampleCount;
-    }
-    CHECK_EQ(totalCount, mNumSamples);
-    mOwner->endBox();  // ctts
-}
-
-void MPEG4Writer::Track::writeStssBox() {
+void MoofWriter::Track::writeStssBox() {
     mOwner->beginBox("stss");
     mOwner->writeInt32(0);  // version=0, flags=0
-    mOwner->writeInt32(mNumStssTableEntries);  // number of sync frames
-    for (List<int32_t>::iterator it = mStssTableEntries.begin();
-        it != mStssTableEntries.end(); ++it) {
-        mOwner->writeInt32(*it);
-    }
+    mOwner->writeInt32(0);  // number of sync frames
     mOwner->endBox();  // stss
 }
 
-void MPEG4Writer::Track::writeStszBox() {
-    ALOGD("writeStszBox for %s track", isAudio()? "Audio": "Video");
+void MoofWriter::Track::writeStszBox() {
+    ALOGD("writeStszBox for %s track sameSize=%d numSamples=%d",
+          isAudio()? "Audio": "Video",
+          mSamplesHaveSameSize, mNumSamples);
     mOwner->beginBox("stsz");
     mOwner->writeInt32(0);  // version=0, flags=0
-    if (mSamplesHaveSameSize) {
-        CHECK(mCurrentSampleSizeArr != 0);
-        mOwner->write(mCurrentSampleSizeArr, 4, 1);  // default sample size
+    if (1) { // moof mode
+        mOwner->writeInt32(0); // default sample size
+        mOwner->writeInt32(0); // num samples
     } else {
-        mOwner->writeInt32(0);
-    }
-    mOwner->writeInt32(mNumSamples);
-    uint32_t nSamples = mNumSamples;
-    if (!mSamplesHaveSameSize) {
-        for (List<uint32_t *>::iterator it = mSampleSizes.begin();
-            it != mSampleSizes.end(); ++it) {
-            if (nSamples >= kSampleArraySize) {
-                mOwner->write(*it, 4, kSampleArraySize);
-                nSamples -= kSampleArraySize;
-            } else {
-                mOwner->write(*it, 4, nSamples);
-                break;
+        if (mSamplesHaveSameSize) {
+            CHECK(mCurrentSampleSizeArr != 0);
+            mOwner->write(mCurrentSampleSizeArr, 4, 1);  // default sample size
+        } else {
+            mOwner->writeInt32(0);
+        }
+        mOwner->writeInt32(mNumSamples);
+        uint32_t nSamples = mNumSamples;
+        if (!mSamplesHaveSameSize) {
+            for (List<uint32_t *>::iterator it = mSampleSizes.begin();
+                 it != mSampleSizes.end(); ++it) {
+                if (nSamples >= kSampleArraySize) {
+                    mOwner->write(*it, 4, kSampleArraySize);
+                    nSamples -= kSampleArraySize;
+                } else {
+                    mOwner->write(*it, 4, nSamples);
+                    break;
+                }
             }
         }
     }
     mOwner->endBox();  // stsz
-    ALOGD("writeStszBox: X");
 }
 
-void MPEG4Writer::Track::writeStscBox() {
+void MoofWriter::Track::writeStscBox() {
     mOwner->beginBox("stsc");
     mOwner->writeInt32(0);  // version=0, flags=0
-    mOwner->writeInt32(mNumStscTableEntries);
-    for (List<StscTableEntry>::iterator it = mStscTableEntries.begin();
-        it != mStscTableEntries.end(); ++it) {
-        mOwner->writeInt32(it->firstChunk);
-        mOwner->writeInt32(it->samplesPerChunk);
-        mOwner->writeInt32(it->sampleDescriptionId);
-    }
+    mOwner->writeInt32(0); // mNumStscTableEntries
     mOwner->endBox();  // stsc
 }
 
-void MPEG4Writer::Track::writeStcoBox(bool use32BitOffset) {
+void MoofWriter::Track::writeStcoBox(bool use32BitOffset) {
     mOwner->beginBox(use32BitOffset? "stco": "co64");
     mOwner->writeInt32(0);  // version=0, flags=0
+#if 1
+    mOwner->writeInt32(0);
+#else
     mOwner->writeInt32(mNumStcoTableEntries);
     for (List<off64_t>::iterator it = mChunkOffsets.begin();
         it != mChunkOffsets.end(); ++it) {
@@ -2859,10 +2796,11 @@ void MPEG4Writer::Track::writeStcoBox(bool use32BitOffset) {
             mOwner->writeInt64((*it));
         }
     }
+#endif
     mOwner->endBox();  // stco or co64
 }
 
-void MPEG4Writer::writeUdtaBox() {
+void MoofWriter::writeUdtaBox() {
     beginBox("udta");
     writeGeoDataBox();
     endBox();
@@ -2871,7 +2809,7 @@ void MPEG4Writer::writeUdtaBox() {
 /*
  * Geodata is stored according to ISO-6709 standard.
  */
-void MPEG4Writer::writeGeoDataBox() {
+void MoofWriter::writeGeoDataBox() {
     beginBox("\xA9xyz");
     /*
      * For historical reasons, any user data start
@@ -2885,6 +2823,11 @@ void MPEG4Writer::writeGeoDataBox() {
     writeLongitude(mLongitudex10000);
     writeInt8(0x2F);
     endBox();
+}
+
+void MoofWriter::notifyGotAllCodecSpecificData() {
+    //Mutex::Autolock l(mLock);
+    mGotAllCodecSpecificData++;
 }
 
 }  // namespace android

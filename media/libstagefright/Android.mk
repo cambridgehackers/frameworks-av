@@ -25,7 +25,8 @@ LOCAL_SRC_FILES:=                         \
         MPEG2TSWriter.cpp                 \
         MPEG4Extractor.cpp                \
         MPEG4Writer.cpp                   \
-        MoofExtractor.cpp                \
+        MoofExtractor.cpp                 \
+        MoofWriter.cpp                    \
         MediaBuffer.cpp                   \
         MediaBufferGroup.cpp              \
         MediaCodec.cpp                    \

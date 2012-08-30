@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#ifndef MPEG4_WRITER_H_
+#ifndef MOOF_WRITER_H_
 
-#define MPEG4_WRITER_H_
+#define MOOF_WRITER_H_
 
 #include <stdio.h>
 
@@ -30,10 +30,10 @@ class MediaBuffer;
 class MediaSource;
 class MetaData;
 
-class MPEG4Writer : public MediaWriter {
+class MoofWriter : public MediaWriter {
 public:
-    MPEG4Writer(const char *filename);
-    MPEG4Writer(int fd);
+    MoofWriter(const char *filename);
+    MoofWriter(int fd);
 
     virtual status_t addSource(const sp<MediaSource> &source);
     virtual status_t start(MetaData *param = NULL);
@@ -59,9 +59,10 @@ public:
     status_t setGeoData(int latitudex10000, int longitudex10000);
     void setStartTimeOffsetMs(int ms) { mStartTimeOffsetMs = ms; }
     int32_t getStartTimeOffsetMs() const { return mStartTimeOffsetMs; }
+    void notifyGotAllCodecSpecificData();
 
 protected:
-    virtual ~MPEG4Writer();
+    virtual ~MoofWriter();
 
 private:
     class Track;
@@ -75,12 +76,11 @@ private:
     bool mStarted;  // Writer thread + track threads started successfully
     bool mWriterThreadStarted;  // Only writer thread started successfully
     off64_t mOffset;
-    off_t mMdatOffset;
+    off64_t mDataOffsetOffset; // offset of data offset in "tfhd" box
+    int32_t mFileType;
     uint8_t *mMoovBoxBuffer;
     off64_t mMoovBoxBufferOffset;
     bool  mWriteMoovBoxToMemory;
-    off64_t mFreeBoxOffset;
-    bool mStreamableFile;
     off64_t mEstimatedMoovBoxSize;
     uint32_t mInterleaveDurationUs;
     int32_t mTimeScale;
@@ -89,6 +89,8 @@ private:
     int mLongitudex10000;
     bool mAreGeoTagsAvailable;
     int32_t mStartTimeOffsetMs;
+    int mGotAllCodecSpecificData;
+    int32_t mSequenceNumber;
 
     Mutex mLock;
 
@@ -101,23 +103,38 @@ private:
     status_t startTracks(MetaData *params);
     size_t numTracks();
     int64_t estimateMoovBoxSize(int32_t bitRate);
+    int64_t estimateMoofBoxSize();
 
     struct Chunk {
         Track               *mTrack;        // Owner
-        int64_t             mTimeStampUs;   // Timestamp of the 1st sample
-        List<MediaBuffer *> mSamples;       // Sample data
+        int64_t             mTimeStampUs;   // Timestamp of the sample
+        int32_t             mDurationTicks; // Duration of sample
+        MediaBuffer * mSamples;             // Sample data
 
         // Convenient constructor
         Chunk(): mTrack(NULL), mTimeStampUs(0) {}
 
-        Chunk(Track *track, int64_t timeUs, List<MediaBuffer *> samples)
-            : mTrack(track), mTimeStampUs(timeUs), mSamples(samples) {
+    Chunk(Track *track, int64_t timeUs,
+          int32_t durationTicks, MediaBuffer * samples)
+            : mTrack(track),
+            mTimeStampUs(timeUs),
+            mDurationTicks(durationTicks),
+            mSamples(samples) {
         }
 
     };
     struct ChunkInfo {
         Track               *mTrack;        // Owner
-        List<Chunk>         mChunks;        // Remaining chunks to be written
+        List<Chunk>          mChunks;       // Remaining chunks to be written
+
+        int32_t              mSampleCount;
+
+        // duration of each of the sample in this chunk for trun box
+        int64_t               mSampleDurationTicks;
+        // size of each of the samples in this chunk for trun box
+        int64_t               mSampleSize;
+
+        int64_t               mBaseMediaDecodeTimeUs;
 
         // Previous chunk timestamp that has been written
         int64_t mPrevChunkTimestampUs;
@@ -130,7 +147,7 @@ private:
     bool            mIsFirstChunk;
     volatile bool   mDone;                  // Writer thread is done?
     pthread_t       mThread;                // Thread id for the writer
-    List<ChunkInfo> mChunkInfos;            // Chunk infos
+    Vector<ChunkInfo> mChunkInfos;            // Chunk infos
     Condition       mChunkReadyCondition;   // Signal that chunks are available
 
     // Writer thread handling
@@ -176,8 +193,12 @@ private:
     void trackProgressStatus(size_t trackId, int64_t timeUs, status_t err = OK);
     void writeCompositionMatrix(int32_t degrees);
     void writeMvhdBox(int64_t durationUs);
+    void writeMvexBox();
     void writeMoovBox(int64_t durationUs);
-    void writeFtypBox(MetaData *param);
+    void writeMfhdBox(int64_t durationUs);
+    void writeMoofBox(int64_t durationUs, Chunk &chunk);
+    void writeTrackFragmentHeader(ChunkInfo &chunkInfo, bool use32BitOffset = true);
+    void writeFtypBox();
     void writeUdtaBox();
     void writeGeoDataBox();
     void writeLatitude(int degreex10000);
@@ -186,10 +207,10 @@ private:
     void release();
     status_t reset();
 
-    MPEG4Writer(const MPEG4Writer &);
-    MPEG4Writer &operator=(const MPEG4Writer &);
+    MoofWriter(const MoofWriter &);
+    MoofWriter &operator=(const MoofWriter &);
 };
 
 }  // namespace android
 
-#endif  // MPEG4_WRITER_H_
+#endif  // MOOF_WRITER_H_
