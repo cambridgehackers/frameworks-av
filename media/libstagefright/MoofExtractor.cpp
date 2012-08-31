@@ -158,9 +158,11 @@ MoofDataSource::MoofDataSource(const sp<DataSource> &source)
       mCachedOffset(0),
       mCachedSize(0),
       mCache(NULL) {
+    ALOGD("MoofDataSource");
 }
 
 MoofDataSource::~MoofDataSource() {
+    ALOGD("~MoofDataSource");
     clearCache();
 }
 
@@ -286,6 +288,7 @@ private:
     sem_t mProducerSemaphore;
     sem_t mConsumerSemaphore;
     bool  mDone;
+    bool  mUseThread;
     double mSampleTableTimeStamp;
     double mFirstMfts;
 
@@ -306,13 +309,29 @@ MoofSampleTable::MoofSampleTable(uint64_t offset, sp<MoofDataSource> &dataSource
 {
     sem_init(&mConsumerSemaphore, 0, 1);
     sem_init(&mProducerSemaphore, 0, 0);
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-    ALOGV("starting thread");
-    mDone = false;
-    pthread_create(&mThread, &attr, threadWrapper, this);
-    pthread_attr_destroy(&attr);
+    mUseThread = false;
+    if (mUseThread) {
+        ALOGV("starting thread");
+        mDone = false;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+        pthread_create(&mThread, &attr, threadWrapper, this);
+        pthread_attr_destroy(&attr);
+    } else {
+        ALOGV("not using thread");
+        //mThread = 0;
+        char skipbuf[2048];
+        size_t nbytes = 0;
+        while (nbytes < mOffset) {
+            size_t bytestoread =
+                (mOffset > sizeof(skipbuf)) ? sizeof(skipbuf) : mOffset;
+            int nread = mDataSource->readAt(nbytes, skipbuf, bytestoread);
+            if (nread <= 0)
+                break;
+            nbytes += nread;
+        }
+    }
 
     memset(mTrackIndexes, 0, sizeof(mTrackIndexes));
     memset(mLastDecodeTime, 0, sizeof(mLastDecodeTime));
@@ -336,9 +355,12 @@ MoofSampleTable::~MoofSampleTable()
 {
     mDone = true;
     void *ret;
-    ALOGV("~MoofSampleTable: pthread_joining ...");
-    pthread_join(mThread, &ret);
-    ALOGV("~MoofSampleTable: thread done");
+    if (mUseThread) {
+        ALOGD("~MoofSampleTable: pthread_joining ...");
+        sem_post(&mProducerSemaphore);
+        pthread_join(mThread, &ret);
+        ALOGD("~MoofSampleTable: thread done");
+    }
 
     sem_destroy(&mConsumerSemaphore);
     sem_destroy(&mProducerSemaphore);
@@ -346,6 +368,7 @@ MoofSampleTable::~MoofSampleTable()
 
 void MoofSampleTable::onMetaDataReady()
 {
+    ALOGD("onMetaDataReady()");
     sem_post(&mProducerSemaphore);
 }
 
@@ -375,7 +398,7 @@ void MoofSampleTable::run()
 {
     char skipbuf[1024];
     mDataSource->readAt(0, skipbuf, mOffset);
-    while (1) {
+    while (!mDone) {
         ALOGV("MoofSampleTable::run() waiting for producer semaphore");
         sem_wait(&mProducerSemaphore);
         ALOGV("MoofSampleTable::run() producer semaphore proceeding");
@@ -823,13 +846,18 @@ int MoofSampleTable::getSample(size_t trackIndex, size_t sampleIndex, MoofSample
         ALOGV("%s:%d: unlocking sample lock %d", __FILE__, __LINE__, trackIndex);
         mSampleLock[trackIndex].unlock();
 
-        // tell it to read more samples
-        sem_post(&mProducerSemaphore);
-
-        // and wait for the response
-        ALOGV("getSample waiting for consumer semaphore");
-        sem_wait(&mConsumerSemaphore);
-        ALOGV("getSample consumer semaphore proceeding");
+        if (mUseThread) {
+            // tell it to read more samples
+            sem_post(&mProducerSemaphore);
+            // and wait for the response
+            ALOGV("getSample waiting for consumer semaphore");
+            sem_wait(&mConsumerSemaphore);
+            ALOGV("getSample consumer semaphore proceeding");
+        } else {
+            ALOGD("calling readSamples()");
+            readSamples();
+            ALOGD("calling returned()");
+        }
 
         ALOGV("%s:%d: locking sample lock %d", __FILE__, __LINE__, trackIndex);
         mSampleLock[trackIndex].lock();
@@ -948,6 +976,7 @@ MoofExtractor::MoofExtractor(const sp<DataSource> &source)
 }
 
 MoofExtractor::~MoofExtractor() {
+    ALOGD("~MoofExtractor");
     Track *track = mFirstTrack;
     while (track) {
         Track *next = track->next;
@@ -965,6 +994,7 @@ MoofExtractor::~MoofExtractor() {
         sinf = next;
     }
     mFirstSINF = NULL;
+    ALOGD("~MoofExtractor done");
 }
 
 sp<MetaData> MoofExtractor::getMetaData() {
