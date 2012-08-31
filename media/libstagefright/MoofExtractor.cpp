@@ -29,9 +29,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <pthread.h>
-#include <semaphore.h>
-
 #include <media/stagefright/foundation/ABitReader.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
@@ -279,16 +276,8 @@ private:
     status_t readSample(const sp<MetaData> &format, MoofSample *sample, MediaBuffer *buffer);
     int readSamples();
 
-    static void *threadWrapper(void *me);
-    void run();
-
 private:
     Mutex mSampleLock[2];
-    pthread_t mThread;
-    sem_t mProducerSemaphore;
-    sem_t mConsumerSemaphore;
-    bool  mDone;
-    bool  mUseThread;
     double mSampleTableTimeStamp;
     double mFirstMfts;
 
@@ -307,20 +296,7 @@ MoofSampleTable::MoofSampleTable(uint64_t offset, sp<MoofDataSource> &dataSource
     : mOffset(offset)
     , mDataSource(dataSource)
 {
-    sem_init(&mConsumerSemaphore, 0, 1);
-    sem_init(&mProducerSemaphore, 0, 0);
-    mUseThread = false;
-    if (mUseThread) {
-        ALOGV("starting thread");
-        mDone = false;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-        pthread_create(&mThread, &attr, threadWrapper, this);
-        pthread_attr_destroy(&attr);
-    } else {
-        ALOGV("not using thread");
-        //mThread = 0;
+    {
         char skipbuf[2048];
         size_t nbytes = 0;
         while (nbytes < mOffset) {
@@ -353,23 +329,13 @@ MoofSampleTable::MoofSampleTable(uint64_t offset, sp<MoofDataSource> &dataSource
 
 MoofSampleTable::~MoofSampleTable()
 {
-    mDone = true;
     void *ret;
-    if (mUseThread) {
-        ALOGD("~MoofSampleTable: pthread_joining ...");
-        sem_post(&mProducerSemaphore);
-        pthread_join(mThread, &ret);
-        ALOGD("~MoofSampleTable: thread done");
-    }
-
-    sem_destroy(&mConsumerSemaphore);
-    sem_destroy(&mProducerSemaphore);
+    ALOGD("~MoofSampleTable");
 }
 
 void MoofSampleTable::onMetaDataReady()
 {
     ALOGD("onMetaDataReady()");
-    sem_post(&mProducerSemaphore);
 }
 
 void MoofSampleTable::signalBufferReturned(MediaBuffer *buffer)
@@ -385,26 +351,6 @@ void MoofSampleTable::signalBufferReturned(MediaBuffer *buffer)
     //FIXME: should reuse the buffer
     buffer->setObserver(NULL);
     buffer->release();
-}
-
-void *MoofSampleTable::threadWrapper(void *self)
-{
-    MoofSampleTable *sampleTable = static_cast<MoofSampleTable *>(self);
-    sampleTable->run();
-    return NULL;
-}
-
-void MoofSampleTable::run()
-{
-    char skipbuf[1024];
-    mDataSource->readAt(0, skipbuf, mOffset);
-    while (!mDone) {
-        ALOGV("MoofSampleTable::run() waiting for producer semaphore");
-        sem_wait(&mProducerSemaphore);
-        ALOGV("MoofSampleTable::run() producer semaphore proceeding");
-        readSamples();
-        sem_post(&mConsumerSemaphore);
-    }
 }
 
 int MoofSampleTable::acquireBuffer(MediaBuffer **pbuffer, int track, uint64_t size)
@@ -846,18 +792,9 @@ int MoofSampleTable::getSample(size_t trackIndex, size_t sampleIndex, MoofSample
         ALOGV("%s:%d: unlocking sample lock %d", __FILE__, __LINE__, trackIndex);
         mSampleLock[trackIndex].unlock();
 
-        if (mUseThread) {
-            // tell it to read more samples
-            sem_post(&mProducerSemaphore);
-            // and wait for the response
-            ALOGV("getSample waiting for consumer semaphore");
-            sem_wait(&mConsumerSemaphore);
-            ALOGV("getSample consumer semaphore proceeding");
-        } else {
-            ALOGD("calling readSamples()");
-            readSamples();
-            ALOGD("calling returned()");
-        }
+        ALOGV("calling readSamples()");
+        readSamples();
+        ALOGV("calling returned()");
 
         ALOGV("%s:%d: locking sample lock %d", __FILE__, __LINE__, trackIndex);
         mSampleLock[trackIndex].lock();
