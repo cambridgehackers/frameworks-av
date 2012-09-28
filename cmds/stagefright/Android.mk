@@ -57,7 +57,8 @@ LOCAL_SRC_FILES:=         \
         recordvideo.cpp
 
 LOCAL_SHARED_LIBRARIES := \
-	libstagefright liblog libutils libbinder libstagefright_foundation
+	libstagefright liblog libutils libbinder libstagefright_foundation \
+	libcamera_client libgui
 
 LOCAL_C_INCLUDES:= \
 	frameworks/av/media/libstagefright \
@@ -165,3 +166,28 @@ LOCAL_MODULE:= codec
 
 include $(BUILD_EXECUTABLE)
 
+################################################################################
+
+include $(CLEAR_VARS)
+
+LOCAL_SRC_FILES:=         \
+        SineSource.cpp    \
+        cameracapture.cpp
+
+LOCAL_SHARED_LIBRARIES := \
+	libstagefright liblog libutils libbinder libstagefright_foundation \
+	libcamera_client libgui libmedia
+
+LOCAL_C_INCLUDES:= \
+	frameworks/av/media/libstagefright \
+	$(TOP)/frameworks/native/include/media/openmax
+
+LOCAL_CFLAGS += -Wno-multichar
+
+LOCAL_MODULE_TAGS := debug
+
+LOCAL_MODULE:= cameracapture
+
+include $(BUILD_EXECUTABLE)
+
+################################################################################
