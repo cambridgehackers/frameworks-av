@@ -120,6 +120,102 @@ void httpPost(int sock, const char *hostname, const char *path)
     }
 }
 
+class CameraRecorder : public virtual RefBase {
+public:
+    CameraRecorder(int cameraNumber)
+        : mCameraNumber(cameraNumber) {
+    }
+    
+    void connect() {
+        status_t err = OK;
+        mCamera = Camera::connect(0);
+        mICamera = mCamera->remote();
+    }
+
+    struct Params {
+        int width;
+        int height;
+        int codec;
+        int output_format;
+        int frameRateFps;
+        int nFrames;        
+    };
+
+    void startPreview(const Params &params) {
+        sp<SurfaceComposerClient> surfaceComposerClient = new SurfaceComposerClient();
+        sp<SurfaceControl> surfaceControl =
+            surfaceComposerClient->createSurface(0, params.width, params.height, PIXEL_FORMAT_RGB_888);
+
+        SurfaceComposerClient::openGlobalTransaction();
+        surfaceControl->setLayer(0x40000000);
+        SurfaceComposerClient::closeGlobalTransaction();
+
+        mSurface = surfaceControl->getSurface();
+
+        mCamera->setPreviewDisplay(mSurface);
+        mCamera->startPreview();
+    }
+
+    void startRecording(const Params &params, int fd) {
+        Size videoSize(params.width, params.height);
+        sp<ICameraRecordingProxy> cameraRecordingProxy = mCamera->getRecordingProxy();
+        mCamera->unlock();
+
+        int encoder = VIDEO_ENCODER_H264;
+        switch (params.codec) {
+        case 2:
+            encoder = VIDEO_ENCODER_H263;
+            break;
+        case 1:
+            encoder = VIDEO_ENCODER_MPEG_4_SP;
+            break;
+        case 0:
+        default:
+            encoder = VIDEO_ENCODER_H264;
+            break;
+        }
+
+        sp<MediaRecorder> recorder = new MediaRecorder();
+        mRecorder = recorder;
+        recorder->setCamera(mICamera, cameraRecordingProxy);
+        recorder->setVideoSource(VIDEO_SOURCE_CAMERA);
+        recorder->setOutputFormat(params.output_format);
+
+        recorder->setVideoSize(params.width, params.height);
+        recorder->setVideoFrameRate(params.frameRateFps);
+        recorder->setVideoEncoder(encoder);
+        char rparams[64];
+        snprintf(rparams, sizeof(rparams), "max-duration=%d", params.nFrames/params.frameRateFps*1000);
+        recorder->setParameters(String8(rparams));
+
+        recorder->setOutputFile(fd, 0, 0);
+
+        recorder->setPreviewSurface(mSurface);
+
+        recorder->setListener(new MyMediaRecorderListener());
+
+        recorder->prepare();
+
+        recorder->start();
+
+    }
+    
+    void stopRecording() {
+        close(mFd);
+        mRecorder->close();
+        mRecorder->release();
+        mCamera->disconnect();
+    }
+
+private:
+    int mCameraNumber;
+    int mFd;
+    sp<Camera> mCamera;
+    sp<ICamera> mICamera;
+    sp<Surface> mSurface;
+    sp<MediaRecorder> mRecorder;
+};
+
 int main(int argc, char **argv) {
 
     // Default values for the program if not overwritten
@@ -137,7 +233,9 @@ int main(int argc, char **argv) {
     output_format output_format = OUTPUT_FORMAT_THREE_GPP;
     const char *fileName = "/sdcard/output.mp4";
     const char *hostname = 0;
-    const char *streamName = "klaatu1";
+    const char *streamNames[4];
+    sp<CameraRecorder> recorders[4];
+    int numStreams = 0;
     int port = 80;
 
     android::ProcessState::self()->startThreadPool();
@@ -188,7 +286,7 @@ int main(int argc, char **argv) {
 
             case 's':
             {
-                streamName = optarg;
+                streamNames[numStreams++] = optarg;
                 break;
             }
 
@@ -233,72 +331,32 @@ int main(int argc, char **argv) {
         }
     }
 
-    status_t err = OK;
-    sp<Camera> camera = Camera::connect(0);
-    sp<ICamera> icamera = camera->remote();
+    for (int cam = 0; cam < numStreams; cam++) {
+        sp<CameraRecorder> recorder = new CameraRecorder(cam);
+        recorders[cam] = recorder;
 
-    sp<SurfaceComposerClient> surfaceComposerClient = new SurfaceComposerClient();
-    sp<SurfaceControl> surfaceControl =
-        surfaceComposerClient->createSurface(0, width, height, PIXEL_FORMAT_RGB_888);
+        recorder->connect();
+        CameraRecorder::Params params;
+        params.width = width;
+        params.height = height;
+        params.codec = codec;
+        params.output_format = output_format;
+        params.frameRateFps = frameRateFps;
+        params.nFrames = nFrames;
 
-    SurfaceComposerClient::openGlobalTransaction();
-    surfaceControl->setLayer(0x40000000);
-    SurfaceComposerClient::closeGlobalTransaction();
-
-    sp<Surface> surface = surfaceControl->getSurface();
-
-    camera->setPreviewDisplay(surface);
-
-    Size videoSize(width,height);
-    sp<ICameraRecordingProxy> cameraRecordingProxy = camera->getRecordingProxy();
-
-
-    camera->startPreview();
-    camera->unlock();
-
-    int encoder = VIDEO_ENCODER_H264;
-    switch (codec) {
-    case 2:
-        encoder = VIDEO_ENCODER_H263;
-        break;
-    case 1:
-        encoder = VIDEO_ENCODER_MPEG_4_SP;
-        break;
-    case 0:
-    default:
-        encoder = VIDEO_ENCODER_H264;
-        break;
+        recorder->startPreview(params);
+        
+        int fd = -1;
+        if (hostname == 0) {
+            fd = open(fileName, O_WRONLY|O_CREAT, 0660);
+        } else {
+            fd = connectToHost(hostname, port);
+            char path[256];
+            snprintf(path, sizeof(path), "/%s", streamNames[cam]);
+            httpPost(fd, hostname, path);
+        }
+        recorder->startRecording(params, fd);
     }
-
-    sp<MediaRecorder> recorder = new MediaRecorder();
-    recorder->setCamera(icamera, cameraRecordingProxy);
-    recorder->setVideoSource(VIDEO_SOURCE_CAMERA);
-    recorder->setOutputFormat(output_format);
-
-    recorder->setVideoSize(width, height);
-    recorder->setVideoFrameRate(frameRateFps);
-    recorder->setVideoEncoder(encoder);
-    char params[64];
-    snprintf(params, sizeof(params), "max-duration=%d", nFrames/frameRateFps*1000);
-    recorder->setParameters(String8(params));
-    int fd = -1;
-    if (hostname == 0) {
-        fd = open(fileName, O_WRONLY|O_CREAT, 0660);
-    } else {
-        fd = connectToHost(hostname, port);
-        char path[256];
-        snprintf(path, sizeof(path), "/%s", streamName);
-        httpPost(fd, hostname, path);
-    }
-    recorder->setOutputFile(fd, 0, 0);
-
-    recorder->setPreviewSurface(surface);
-
-    recorder->setListener(new MyMediaRecorderListener());
-
-    recorder->prepare();
-
-    recorder->start();
 
     int64_t start = systemTime();
     while (!sDone) {
@@ -306,9 +364,9 @@ int main(int argc, char **argv) {
     }
     int64_t end = systemTime();
 
-    recorder->close();
-    recorder->release();
-    camera->disconnect();
+    for (int cam = 0; cam < numStreams; cam++) {
+        recorders[cam]->stopRecording();
+    }
 
     fprintf(stderr, "$\n");
 
