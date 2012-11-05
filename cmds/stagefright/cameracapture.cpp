@@ -128,8 +128,10 @@ public:
     
     void connect() {
         status_t err = OK;
-        mCamera = Camera::connect(0);
+        mCamera = Camera::connect(mCameraNumber);
+        fprintf(stderr, "%s:%d connected %d mCamera=%p\n", __FILE__, __LINE__, mCameraNumber, mCamera.get());
         mICamera = mCamera->remote();
+        fprintf(stderr, "%s:%d remoted %d mICamera=%p\n", __FILE__, __LINE__, mCameraNumber, mICamera.get());
     }
 
     struct Params {
@@ -331,10 +333,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    for (int cam = 0; cam < numStreams; cam++) {
+    for (int cam = numStreams-1; cam >= 0; cam--) {
         sp<CameraRecorder> recorder = new CameraRecorder(cam);
         recorders[cam] = recorder;
 
+        fprintf(stderr, "%s:%d connect recorder\n", __FILE__, __LINE__);
         recorder->connect();
         CameraRecorder::Params params;
         params.width = width;
@@ -344,17 +347,23 @@ int main(int argc, char **argv) {
         params.frameRateFps = frameRateFps;
         params.nFrames = nFrames;
 
+        fprintf(stderr, "%s:%d startPreview\n", __FILE__, __LINE__);
         recorder->startPreview(params);
         
         int fd = -1;
         if (hostname == 0) {
-            fd = open(fileName, O_WRONLY|O_CREAT, 0660);
+            char streamfile[128];
+            snprintf(streamfile, sizeof(streamfile), "/sdcard/%s", streamNames[cam]);
+            fprintf(stderr, "%s:%d open %s\n", __FILE__, __LINE__, streamfile);
+            fd = open(streamfile, O_WRONLY|O_CREAT, 0660);
         } else {
+            fprintf(stderr, "%s:%d connect %s:%d\n", __FILE__, __LINE__, hostname, port);
             fd = connectToHost(hostname, port);
             char path[256];
             snprintf(path, sizeof(path), "/%s", streamNames[cam]);
             httpPost(fd, hostname, path);
         }
+        fprintf(stderr, "%s:%d start recording fd=%d\n", __FILE__, __LINE__, fd);
         recorder->startRecording(params, fd);
     }
 
